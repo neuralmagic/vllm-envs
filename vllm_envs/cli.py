@@ -187,7 +187,7 @@ def cmd_status(cfg: Config, args) -> int:
     if dirty:
         print("dirty:      csrc/cmake working tree is dirty → private builds, no publish")
     for var, val in overrides.items():
-        print(f"override:   layer-3 caching DISABLED: {var}={val}")
+        print(f"override:   build-layer caching DISABLED: {var}={val}")
     return 0
 
 

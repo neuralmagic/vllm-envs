@@ -44,23 +44,46 @@ Auto-init on `git worktree add` fires only for worktrees of a repo where the hoo
 
 ## How it works
 
-Caches, each content-addressed under `~/.cache/vllm-envs/`:
+An env is just a git worktree plus a private `.venv`, assembled from shared content-addressed stores under `~/.cache/vllm-envs/`:
 
-| Cache | Store | Key |
+| Store | Contents | Keyed by |
 |---|---|---|
-| 1a torch + build deps | `venvs-base/` | platform-scoped build requirements + torch pins + python/CUDA version |
-| 1b full python deps | `venvs/` | 1a key + platform-relevant runtime requirements |
-| 2 external sources | `ext-src/` | pins parsed from the worktree's cmake files |
-| 3 compiled extensions | `builds/` (wheels + extracted mirror) + `cmake-build/` (incremental trees) | working-tree content hash of csrc/ cmake/ CMakeLists.txt setup.py |
-| 4 python source | the worktree | n/a |
+| `venvs-base/` | torch + build deps | build requirements + torch pins + python/CUDA version |
+| `venvs/` | full deps (derived from `venvs-base`) | base key + runtime requirements |
+| `ext-src/` | pinned external sources (cutlass, flash-attn, ...) | project + pin parsed from the worktree's cmake files |
+| `builds/` | compiled-extension wheel + extracted-file mirror + editable-install replay | content hash of csrc/ cmake/ CMakeLists.txt setup.py (+ python/CUDA) |
+| `cmake-build/` | persistent cmake trees for incremental local builds | same hash as `builds/` |
 
-Only 1a→1b is a derivation chain (1b templates are reflink-cloned from 1a and topped up). 1b, 2, and 3 are independent, parallel caches: their keys don't reference each other, and layer 2 is a pure input cache for layer-3 builds whose pins are already covered by the layer-3 key (the cmake files are hashed). By change frequency on main: csrc/cmake (layer 3) changes many times a day, requirements (1b) roughly weekly, external pins (2) roughly monthly — so layer 3 is resolved via the precompiled-wheel fast path whenever the tree matches a main commit.
+```mermaid
+flowchart LR
+    subgraph store ["~/.cache/vllm-envs (content-addressed, LRU gc)"]
+        base["venvs-base/#lt;hash#gt;<br>torch + build deps"]
+        full["venvs/#lt;hash#gt;<br>+ runtime deps"]
+        builds["builds/#lt;hash#gt;<br>wheel + extracted mirror<br>+ editable replay"]
+        ext["ext-src/#lt;project#gt;-#lt;pin#gt;"]
+        cmake["cmake-build/#lt;hash#gt;"]
+    end
+    wheelsvllm["wheels.vllm.ai"]
+    subgraph env ["env = git worktree"]
+        venv[".venv (private clone)"]
+        wt["python source<br>+ extracted .so"]
+    end
+    base -- "reflink + top-up" --> full
+    full -- "venv: reflink clone" --> venv
+    builds -- "attach: .so reflinks<br>+ editable install" --> wt
+    builds -- "attach: .pth/finder/dist-info" --> venv
+    wheelsvllm -. "clean tree on a main commit" .-> builds
+    ext -- "*_SRC_DIR" --> cmake
+    cmake -. "local ccache build" .-> builds
+```
 
-- Envs get **private reflink-cloned venvs** — edit site-packages freely.
-- Extensions attach via each commit's own `VLLM_PRECOMPILED_WHEEL_LOCATION` extraction logic (historically correct for old releases). After extraction, the `.so` files are rewritten as **reflinks of a shared mirror** in `builds/<hash>/extracted/`, so N envs at the same hash share one physical copy (~450MB saved per env). CoW means a private rebuild or store eviction never affects other envs.
-- Layer-3 resolution order for clean trees: store hit → precompiled wheel fetched from wheels.vllm.ai (when build inputs match the origin/main merge-base; published into the store) → local ccache build.
-- Dirty csrc/ or user `*_SRC_DIR` overrides → private builds, never published to the shared store.
-- ccache is forced (`VLLM_DISABLE_SCCACHE=1`); clean builds use a persistent per-hash cmake build tree for incremental rebuilds.
+`ve sync` (run by `ve new`/`ve init` and the post-checkout hook) resolves three layers, skipping whatever is already consistent:
+
+1. **venv** — requirements files are hashed; on a hit the env's `.venv` is reflink-cloned from the cached template (CoW: edit site-packages freely, other envs are unaffected). Templates are derived `venvs-base` → `venvs`, so a runtime-requirements change only re-installs the delta. On a commit hop the private venv is converged in place (top-up install + uninstall of dropped deps).
+2. **build** — csrc/cmake/setup.py content is hashed. Clean-tree resolution order: store hit → precompiled wheel from wheels.vllm.ai (when the tree matches the origin/main merge-base; published into the store) → local ccache build, with `ext-src/` pins injected via `*_SRC_DIR` env vars and a persistent per-hash cmake tree for incremental rebuilds. Dirty csrc/ or user `*_SRC_DIR` overrides → private builds, never published.
+3. **attach** — makes the worktree importable as an editable install: the wheel's `.so` files and bundled third-party py files are placed into the worktree as reflinks of the shared mirror in `builds/<hash>/extracted/` (~450MB physical shared per env), and the editable-install artifacts (`.pth`, finder, dist-info) are written into the venv. The first attach at a build hash runs vLLM's own setup.py once (historically correct extraction for old releases) and captures the result; later attaches at the same commit replay it with no setup.py run, and an already-attached env is a no-op.
+
+Warm-cache timing: fresh `ve new`/`ve init` ~7s, no-op `ve sync` ~1s; a cold build costs one normal vLLM build, then every env at that hash shares it.
 
 ## Config
 
@@ -80,6 +103,6 @@ Env vars: `VE_CACHE_DIR`, `VE_NO_SYNC=1` (skip hook sync, warn instead).
 
 ## Caveats (v1)
 
-- Requirements top-up on commit hop converges the env venv but does not uninstall removed deps; use `ve sync --fresh-venv` for a clean clone.
+- Requirements top-up on commit hop converges the env venv (installs the delta, uninstalls deps dropped from the template resolution); user-added packages survive, but for a guaranteed-clean venv use `ve sync --fresh-venv`.
 - The upstream precompiled-wheel fallback (`VLLM_USE_PRECOMPILED`) is used when a local build fails; those artifacts are not captured into the store.
 - Old refs resolve historically-correct *pins*, but unpinned transitive deps (e.g. transformers ranges) resolve to current versions, which can break serving on old releases — that's a vLLM requirements property, not an env-tool one.

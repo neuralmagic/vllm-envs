@@ -1,4 +1,4 @@
-"""Layer resolution: venv templates (1a/1b), compiled extensions (3), attach."""
+"""Layer resolution: venv templates, compiled extensions, attach."""
 
 import os
 import re
@@ -212,7 +212,7 @@ def _uninstall_removed_deps(env_root: Path, venv: Path, template: Path) -> None:
 
 
 # --------------------------------------------------------------------------
-# Layer 3: compiled extensions (wheel donor per build-hash)
+# Build layer: compiled extensions (wheel donor per build-hash)
 # --------------------------------------------------------------------------
 
 
@@ -287,7 +287,7 @@ def resolve_build(cfg: Config, env_root: Path, venv: Path) -> BuildResolution:
     dirty = build_paths_dirty(env_root)
 
     if overrides:
-        say(f"layer-3 caching disabled: local overrides active "
+        say(f"build-layer caching disabled: local overrides active "
             f"({', '.join(overrides)}) — building privately")
     elif dirty:
         say(f"build layer: dirty csrc/cmake tree → private build ({bhash})")

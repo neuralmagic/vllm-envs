@@ -10,7 +10,7 @@ PORT=8199
 mkdir -p "$LOGDIR"
 printf 'pass\tref\tve_new_s\tattach\tserve\tcompletion\n' > "$RESULTS"
 
-attach_mode() {  # classify how layer 3 resolved from the ve log
+attach_mode() {  # classify how the build layer resolved from the ve log
     if grep -q "cache HIT" "$1" && ! grep -q "build layer: cache MISS" "$1"; then
         echo store-hit
     elif grep -q "fetching precompiled wheel" "$1"; then
