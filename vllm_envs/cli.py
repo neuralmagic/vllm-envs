@@ -1,0 +1,234 @@
+import argparse
+import re
+import shutil
+import sys
+import time
+from pathlib import Path
+
+from .config import MARKER_NAME, STORE_NAMES, Config, load_config
+from .extprojects import user_overrides
+from .gc import collect_candidates, run_gc, total_size
+from .hashing import build_key, build_paths_dirty, detect_platform, venv_keys
+from .hooks import handle_post_checkout, install_hook
+from .layers import sync
+from .log import die, say, warn
+from .registry import (
+    live_envs,
+    read_marker,
+    register_env,
+    unregister_env,
+    write_marker,
+)
+from .store import read_meta, write_meta
+from .util import git, human_size, run
+
+
+def _repo_root(path: Path) -> Path:
+    try:
+        return Path(git(["rev-parse", "--show-toplevel"], cwd=path))
+    except Exception:
+        die(f"not inside a git repository: {path}")
+        raise
+
+
+def _env_root_from_cwd() -> Path:
+    root = _repo_root(Path.cwd())
+    if not (root / MARKER_NAME).exists():
+        die(f"not inside a ve-managed env (no {MARKER_NAME} in {root})")
+    return root
+
+
+def cmd_new(cfg: Config, args) -> int:
+    repo = _repo_root(Path(args.repo) if args.repo else Path.cwd())
+    if not (repo / "setup.py").exists():
+        warn(f"{repo} does not look like a vLLM checkout (no setup.py)")
+    name = args.name or re.sub(r"[^A-Za-z0-9._\-]", "-", args.ref)
+    dest = cfg.envs_root / name
+    if dest.exists():
+        die(f"env '{name}' already exists at {dest} (use --name or `ve rm {name}`)")
+    cfg.envs_root.mkdir(parents=True, exist_ok=True)
+
+    say(f"creating worktree {dest} at {args.ref}")
+    run(
+        ["git", "worktree", "add", "--detach", str(dest), args.ref],
+        cwd=repo,
+        stream_prefix="[ve]   [git] ",
+    )
+    install_hook(repo)
+    write_marker(dest, {"name": name, "repo": str(repo), "created_at": time.time()})
+    register_env(cfg, name, dest, repo)
+    t0 = time.time()
+    sync(cfg, dest, fresh_venv=False)
+    say(f"env '{name}' ready in {time.time() - t0:.0f}s: {dest}")
+    say(f"activate with: source {dest}/.venv/bin/activate")
+    return 0
+
+
+def cmd_sync(cfg: Config, args) -> int:
+    env_root = _env_root_from_cwd()
+    sync(cfg, env_root, fresh_venv=args.fresh_venv)
+    return 0
+
+
+def cmd_rm(cfg: Config, args) -> int:
+    envs = live_envs(cfg)
+    if args.name not in envs:
+        die(f"unknown env '{args.name}' (known: {', '.join(sorted(envs)) or 'none'})")
+    dest = envs[args.name]
+    repo = Path(read_marker(dest).get("repo", ""))
+    say(f"removing env '{args.name}' at {dest}")
+    if repo.is_dir():
+        run(
+            ["git", "worktree", "remove", "--force", str(dest)],
+            cwd=repo,
+            check=False,
+        )
+    if dest.exists():
+        shutil.rmtree(dest, ignore_errors=True)
+    unregister_env(cfg, args.name)
+    say("removed (shared caches untouched)")
+    return 0
+
+
+def cmd_list(cfg: Config, args) -> int:
+    envs = live_envs(cfg)
+    if not envs:
+        say("no envs")
+        return 0
+    for name, path in sorted(envs.items()):
+        m = read_marker(path)
+        head = git(["rev-parse", "--short", "HEAD"], cwd=path) if path.exists() else "?"
+        print(f"{name:24s} {head:12s} {path}  (build={m.get('build_hash') or 'private'})")
+    return 0
+
+
+def cmd_status(cfg: Config, args) -> int:
+    root = _env_root_from_cwd()
+    m = read_marker(root)
+    platform = cfg.platform or detect_platform()
+    keys = venv_keys(root, platform, cfg.python)
+    bhash = build_key(root, platform, cfg.python)
+    head = git(["rev-parse", "--short", "HEAD"], cwd=root)
+    overrides = user_overrides()
+    dirty = build_paths_dirty(root)
+
+    print(f"env:        {m.get('name', '?')} @ {head}  ({root})")
+    print(f"platform:   {platform} (python {cfg.python})")
+
+    def state(current: str | None, wanted: str) -> str:
+        return "OK" if current == wanted else f"STALE (have {current or 'none'})"
+
+    print(f"venv base:  {keys.base_hash}  {state(m.get('venv_base_hash'), keys.base_hash)}")
+    print(f"venv full:  {keys.full_hash}  {state(m.get('venv_full_hash'), keys.full_hash)}")
+    build_state = state(m.get("build_hash") or None, bhash)
+    if m.get("attach_mode") == "local-build":
+        build_state = "private (dirty/override build)"
+    print(f"build:      {bhash}  {build_state}")
+    if not keys.layout.recognized:
+        print("note:       unrecognized requirements layout — coarse hashing in effect")
+    if dirty:
+        print("dirty:      csrc/cmake working tree is dirty → private builds, no publish")
+    for var, val in overrides.items():
+        print(f"override:   layer-3 caching DISABLED: {var}={val}")
+    return 0
+
+
+def cmd_gc(cfg: Config, args) -> int:
+    run_gc(cfg, dry_run=args.dry_run, free_gb=args.free)
+    return 0
+
+
+def cmd_du(cfg: Config, args) -> int:
+    candidates = collect_candidates(cfg)
+    by_store: dict[str, int] = {}
+    for c in candidates:
+        by_store[c.store] = by_store.get(c.store, 0) + c.size
+    for store in STORE_NAMES:
+        n = sum(1 for c in candidates if c.store == store)
+        print(f"{store:12s} {human_size(by_store.get(store, 0)):>10s}  ({n} entries)")
+    print(f"{'total':12s} {human_size(total_size(candidates)):>10s}  "
+          f"(cap {cfg.max_size_gb:.0f}GB)")
+    return 0
+
+
+def cmd_pin(cfg: Config, args) -> int:
+    store, _, name = args.entry.partition("/")
+    if store not in STORE_NAMES or not name:
+        die(f"expected <store>/<hash>, e.g. builds/abc123 (stores: {', '.join(STORE_NAMES)})")
+    entry = cfg.store(store) / name
+    if not entry.is_dir():
+        die(f"no such entry: {entry}")
+    meta = read_meta(entry)
+    meta["pinned"] = not args.unpin
+    write_meta(entry, meta)
+    say(f"{'unpinned' if args.unpin else 'pinned'} {store}/{name}")
+    return 0
+
+
+def cmd_hook(cfg: Config, args) -> int:
+    if args.event != "post-checkout":
+        return 0
+    return handle_post_checkout(cfg, args.old, args.new, args.flag)
+
+
+def main(argv: list[str] | None = None) -> int:
+    p = argparse.ArgumentParser(
+        prog="ve", description="Fast disposable vLLM dev environments"
+    )
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sp = sub.add_parser("new", help="create env from a ref (worktree + cached layers)")
+    sp.add_argument("ref")
+    sp.add_argument("--name", "-n")
+    sp.add_argument("--repo", help="path to the vLLM clone (default: cwd)")
+    sp.set_defaults(func=cmd_new)
+
+    sp = sub.add_parser("sync", help="re-resolve layers for the current worktree HEAD")
+    sp.add_argument("--fresh-venv", action="store_true",
+                    help="discard env venv divergence, re-clone from template")
+    sp.set_defaults(func=cmd_sync)
+
+    sp = sub.add_parser("rm", help="remove an env (never shared caches)")
+    sp.add_argument("name")
+    sp.set_defaults(func=cmd_rm)
+
+    sp = sub.add_parser("list", help="list envs")
+    sp.set_defaults(func=cmd_list)
+
+    sp = sub.add_parser("status", help="show env layer hashes and cache state")
+    sp.set_defaults(func=cmd_status)
+
+    sp = sub.add_parser("gc", help="prune caches (LRU, 50GB default cap)")
+    sp.add_argument("--dry-run", action="store_true")
+    sp.add_argument("--free", type=float, metavar="GB",
+                    help="evict until this many GB are reclaimed")
+    sp.set_defaults(func=cmd_gc)
+
+    sp = sub.add_parser("du", help="cache disk usage by store")
+    sp.set_defaults(func=cmd_du)
+
+    sp = sub.add_parser("pin", help="pin/unpin a store entry (exempt from gc)")
+    sp.add_argument("entry", help="<store>/<hash>")
+    sp.add_argument("--unpin", action="store_true")
+    sp.set_defaults(func=cmd_pin)
+
+    sp = sub.add_parser("hook", help=argparse.SUPPRESS)
+    sp.add_argument("event")
+    sp.add_argument("old")
+    sp.add_argument("new")
+    sp.add_argument("flag")
+    sp.set_defaults(func=cmd_hook)
+
+    args = p.parse_args(argv)
+    cfg = load_config()
+    for store in STORE_NAMES:
+        cfg.store(store).mkdir(parents=True, exist_ok=True)
+    try:
+        return args.func(cfg, args)
+    except KeyboardInterrupt:
+        warn("interrupted")
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())

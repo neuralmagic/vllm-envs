@@ -1,0 +1,16 @@
+[project]
+name = "vllm-envs"
+version = "0.1.0"
+description = "Fast disposable vLLM dev environments from any commit (content-addressed layer caches)"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+ve = "vllm_envs.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["vllm_envs*"]
