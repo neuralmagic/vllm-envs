@@ -9,6 +9,7 @@ import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 
+from . import editable
 from .config import SCRATCH_DIR_NAME, Config
 from .extprojects import src_dir_env, user_overrides
 from .hashing import VenvKeys, build_key, build_paths_dirty, detect_platform, venv_keys
@@ -391,6 +392,30 @@ def _dedupe_extracted_sos(env_root: Path, wheel: Path, store_entry: Path) -> Non
 
 
 def attach(cfg: Config, env_root: Path, venv: Path, res: BuildResolution) -> None:
+    store_entry = cfg.store("builds") / res.build_hash
+    if res.shared:
+        marker = read_marker(env_root)
+        if (marker.get("build_hash") == res.build_hash
+                and marker.get("attach_mode") == res.mode
+                and editable.editable_present(venv)
+                and editable.worktree_complete(env_root, store_entry)):
+            say(f"attach: up to date (builds/{res.build_hash})")
+            if res.wheel is not None:
+                try:  # seed the replay cache from an already-attached env
+                    editable.capture(env_root, venv, res.wheel, store_entry)
+                except Exception as e:
+                    warn(f"attach capture skipped ({e})")
+            return
+        if res.wheel is not None:
+            try:
+                if editable.replay(env_root, venv, store_entry):
+                    update_marker(
+                        env_root, build_hash=res.build_hash, attach_mode=res.mode
+                    )
+                    return
+            except Exception as e:
+                warn(f"attach replay failed ({e}); running full attach")
+
     env = {"VLLM_USE_PRECOMPILED": "1"}
     if res.wheel is not None:
         env["VLLM_PRECOMPILED_WHEEL_LOCATION"] = str(res.wheel)
@@ -400,9 +425,13 @@ def attach(cfg: Config, env_root: Path, venv: Path, res: BuildResolution) -> Non
     _uv_pip(venv, ["-e", str(env_root), "--no-build-isolation", "--no-deps"], env=env)
     if res.shared and res.wheel is not None:
         try:
-            _dedupe_extracted_sos(env_root, res.wheel, cfg.store("builds") / res.build_hash)
+            _dedupe_extracted_sos(env_root, res.wheel, store_entry)
         except Exception as e:
             warn(f".so dedupe skipped ({e}); worktree keeps plain copies")
+        try:
+            editable.capture(env_root, venv, res.wheel, store_entry)
+        except Exception as e:
+            warn(f"attach capture skipped ({e})")
     update_marker(
         env_root,
         build_hash=res.build_hash if res.shared else "",
