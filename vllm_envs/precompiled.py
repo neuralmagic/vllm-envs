@@ -13,6 +13,7 @@ from pathlib import Path
 from urllib.parse import unquote, urljoin
 
 from .config import BUILD_LAYER_PATHS, Config
+from .extprojects import user_overrides
 from .hashing import cuda_version
 from .log import say
 from .store import touch_last_used, write_meta
@@ -101,6 +102,10 @@ def try_fetch_precompiled(cfg: Config, env_root: Path, bhash: str) -> Path | Non
     Returns the wheel path on success, None when unavailable/unsafe. Caller
     holds the entry lock and has verified the tree is clean for build paths.
     """
+    if user_overrides():
+        # *_SRC_DIR overrides mean the upstream wheel was not built from
+        # this env's inputs — never substitute it
+        return None
     candidates = _candidate_commits(env_root)
     if not candidates:
         return None

@@ -31,8 +31,11 @@ cleanup_gpu() {
 
 serve_check() {  # $1=env dir  $2=log; echoes "serve completion"
     local env=$1 log=$2 serve=fail comp=fail
-    CUDA_VISIBLE_DEVICES=${SWEEP_GPU:-7} timeout 45m "$env/.venv/bin/vllm" serve "$MODEL" \
-        --port $PORT > "$log" 2>&1 &
+    # run from inside the env: vLLM's registry inspection spawns `python -m
+    # vllm...`, and python puts cwd first on sys.path — launching from another
+    # vLLM checkout imports that checkout's source into this env's venv
+    (cd "$env" && CUDA_VISIBLE_DEVICES=${SWEEP_GPU:-7} timeout 45m \
+        .venv/bin/vllm serve "$MODEL" --port $PORT) > "$log" 2>&1 &
     local pid=$!
     for _ in $(seq 1 180); do
         if curl -sf "localhost:$PORT/v1/models" > /dev/null 2>&1; then
