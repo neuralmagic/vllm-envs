@@ -177,16 +177,114 @@ def cmd_gc(cfg: Config, args) -> int:
     return 0
 
 
+def _du_many(paths: list[Path]) -> dict[str, int]:
+    """Parallel `du -sB1` per path (hardlinks deduped within each path)."""
+    procs = {
+        str(p): subprocess.Popen(
+            ["du", "-sB1", str(p)],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+        )
+        for p in paths if p.is_dir()
+    }
+    out: dict[str, int] = {}
+    for key, proc in procs.items():
+        line, _ = proc.communicate()
+        try:
+            out[key] = int(line.split()[0])
+        except (IndexError, ValueError):
+            out[key] = 0
+    return out
+
+
+def _du_combined(paths: list[Path]) -> int:
+    """One du over all paths: hardlinks deduped across them (true footprint)."""
+    existing = [str(p) for p in paths if p.is_dir()]
+    if not existing:
+        return 0
+    proc = run(["du", "-scB1", *existing], check=False)
+    for line in proc.stdout.splitlines():
+        if line.endswith("\ttotal"):
+            return int(line.split()[0])
+    return 0
+
+
+def _age(ts: float) -> str:
+    h = (time.time() - ts) / 3600
+    return f"{h:.1f}h" if h < 48 else f"{h / 24:.1f}d"
+
+
 def cmd_du(cfg: Config, args) -> int:
     candidates = collect_candidates(cfg)
-    by_store: dict[str, int] = {}
-    for c in candidates:
-        by_store[c.store] = by_store.get(c.store, 0) + c.size
+    store_paths = [cfg.store(s) for s in STORE_NAMES]
+    uv_dir = ccache_dir = None
+    p = run(["uv", "cache", "dir"], check=False)
+    if p.returncode == 0 and p.stdout.strip():
+        uv_dir = Path(p.stdout.strip())
+    p = run(["ccache", "--get-config", "cache_dir"], check=False)
+    if p.returncode == 0 and p.stdout.strip():
+        ccache_dir = Path(p.stdout.strip())
+    related = [d for d in (uv_dir, ccache_dir) if d is not None]
+
+    say("measuring disk usage (du over caches — may take a minute)...")
+    phys = _du_many(store_paths + related)
+    combined = _du_combined(store_paths + related)
+
+    print(f"{'store':14s} {'entries':>7s} {'logical':>10s} {'physical':>10s}")
+    logical_total = phys_total = 0
     for store in STORE_NAMES:
-        n = sum(1 for c in candidates if c.store == store)
-        print(f"{store:12s} {human_size(by_store.get(store, 0)):>10s}  ({n} entries)")
-    print(f"{'total':12s} {human_size(total_size(candidates)):>10s}  "
-          f"(cap {cfg.max_size_gb:.0f}GB)")
+        cs = [c for c in candidates if c.store == store]
+        logical = sum(c.size for c in cs)
+        physical = phys.get(str(cfg.store(store)), 0)
+        logical_total += logical
+        phys_total += physical
+        print(f"{store:14s} {len(cs):>7d} {human_size(logical):>10s} "
+              f"{human_size(physical):>10s}")
+    print(f"{'ve total':14s} {'':>7s} {human_size(logical_total):>10s} "
+          f"{human_size(phys_total):>10s}  (cap {cfg.max_size_gb:.0f}GB on logical)")
+
+    print()
+    for label, d in (("uv cache", uv_dir), ("ccache", ccache_dir)):
+        if d is None:
+            print(f"{label:14s} {'—':>18s}  (not found)")
+        else:
+            print(f"{label:14s} {human_size(phys.get(str(d), 0)):>18s}  {d}")
+    all_individual = phys_total + sum(phys.get(str(d), 0) for d in related)
+    shared = max(all_individual - combined, 0)
+    print(f"{'combined':14s} {human_size(combined):>18s}  "
+          f"(hardlink-shared across the above: {human_size(shared)})")
+
+    envs = live_envs(cfg)
+    if envs:
+        print()
+        env_phys = _du_many([path / ".venv" for path in envs.values()])
+        for name, path in sorted(envs.items()):
+            sz = env_phys.get(str(path / ".venv"), 0)
+            print(f"env {name:20s} {human_size(sz):>10s}  {path}/.venv")
+
+    p = run(["df", "-B1", "--output=avail", str(cfg.cache_dir)], check=False)
+    try:
+        avail = int(p.stdout.splitlines()[-1])
+        print(f"\ndisk free: {human_size(avail)} on {cfg.cache_dir}")
+    except (IndexError, ValueError):
+        pass
+    print("note: physical = du blocks (hardlinks deduped; reflink-shared "
+          "extents still counted once per file)")
+
+    if args.entries:
+        for store in STORE_NAMES:
+            cs = sorted(
+                (c for c in candidates if c.store == store),
+                key=lambda c: -c.size,
+            )
+            if not cs:
+                continue
+            print(f"\n== {store} ==")
+            for c in cs:
+                meta = read_meta(c.entry)
+                origin = meta.get("origin") or meta.get("base") or meta.get("kind", "")
+                prot = f"  [{c.protected}]" if c.protected else ""
+                print(f"{human_size(c.size):>10s}  {c.entry.name}  "
+                      f"last-used={_age(c.last_used)}  {origin}{prot}")
     return 0
 
 
@@ -255,7 +353,11 @@ def main(argv: list[str] | None = None) -> int:
                     help="evict until this many GB are reclaimed")
     sp.set_defaults(func=cmd_gc)
 
-    sp = sub.add_parser("du", help="cache disk usage by store")
+    sp = sub.add_parser(
+        "du", help="cache usage audit: per store, uv cache/ccache, live envs"
+    )
+    sp.add_argument("--entries", "-e", action="store_true",
+                    help="also list per-entry sizes with age and origin")
     sp.set_defaults(func=cmd_du)
 
     sp = sub.add_parser("pin", help="pin/unpin a store entry (exempt from gc)")
