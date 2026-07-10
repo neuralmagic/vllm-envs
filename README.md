@@ -17,11 +17,12 @@ Worktree-native workflow — manage your clone in place, and every new worktree 
 ```bash
 git clone https://github.com/vllm-project/vllm && cd vllm
 ve init                     # manage this checkout in place: venv + extensions from cache
-ve activate                 # subshell with the venv active (exit to leave)
-eval "$(ve activate)"       # ...or source it into the current shell
+source .venv/bin/activate   # plain venv activation — always works
 git worktree add ../my-feature my-branch   # auto-runs ve init in the new worktree
-cd ../my-feature && ve activate
+cd ../my-feature && source .venv/bin/activate
 ```
+
+Optionally add `eval "$(ve shellenv)"` to your shell rc (bash/zsh); then `ve activate` sources the env's venv into your current shell from anywhere inside it, and `deactivate` works as usual.
 
 Or spawn disposable envs by ref:
 
@@ -30,7 +31,7 @@ cd /path/to/vllm            # your vLLM clone
 ve new main                 # env from main
 ve new v0.13.0 --name bisect1
 cd ~/vllm-envs/bisect1
-ve activate
+source .venv/bin/activate   # or `ve activate` with shellenv installed
 git checkout <sha>          # post-checkout hook auto-syncs layers
 git bisect start ...        # works transparently
 ve status                   # layer hashes + cache state

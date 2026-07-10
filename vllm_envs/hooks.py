@@ -114,7 +114,7 @@ def _maybe_auto_init(cfg: Config, root: Path) -> int:
         warn(f"auto-init failed: {e}")
         warn("env NOT initialized — run `ve init` in the worktree")
         return 1
-    say(f"env '{name}' ready — activate with: ve activate")
+    say(f"env '{name}' ready — activate with: source {root}/.venv/bin/activate")
     return 0
 
 

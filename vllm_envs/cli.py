@@ -1,5 +1,4 @@
 import argparse
-import os
 import re
 import shutil
 import subprocess
@@ -76,24 +75,44 @@ def cmd_init(cfg: Config, args) -> int:
     t0 = time.time()
     name = init_env(cfg, root, args.name)
     say(f"env '{name}' ready in {time.time() - t0:.0f}s: {root}")
-    say('activate with: ve activate  (or eval "$(ve activate)" in scripts)')
+    say(f"activate with: source {root}/.venv/bin/activate")
+    say("(or `ve activate` after adding to your shell rc: "
+        'eval "$(ve shellenv)")')
+    return 0
+
+
+SHELL_FUNC = """\
+ve() {
+    if [ "$1" = "activate" ]; then
+        local _ve_root _ve_act
+        _ve_root=$(command git rev-parse --show-toplevel 2>/dev/null) || {
+            echo "[ve] not inside a git repo" >&2; return 1; }
+        _ve_act="$_ve_root/.venv/bin/activate"
+        [ -f "$_ve_act" ] || {
+            echo "[ve] no venv at $_ve_root/.venv — run 've sync'" >&2; return 1; }
+        . "$_ve_act"
+    else
+        command ve "$@"
+    fi
+}
+"""
+
+
+def cmd_shellenv(cfg: Config, args) -> int:
+    print(SHELL_FUNC, end="")
     return 0
 
 
 def cmd_activate(cfg: Config, args) -> int:
+    # only reached without the shellenv function; the function sources directly
     root = _env_root_from_cwd()
     activate = root / ".venv" / "bin" / "activate"
     if not activate.exists():
         die(f"no venv at {root / '.venv'} — run `ve sync`")
-    if sys.stdout.isatty():
-        venv = root / ".venv"
-        say(f"activating {venv} in a subshell (exit to leave)")
-        env = dict(os.environ)
-        env["VIRTUAL_ENV"] = str(venv)
-        env["PATH"] = f"{venv / 'bin'}{os.pathsep}{env.get('PATH', '')}"
-        env.pop("PYTHONHOME", None)
-        return subprocess.call([os.environ.get("SHELL", "/bin/bash")], env=env)
     print(f"source {activate}")
+    warn("run the line above (or just `source .venv/bin/activate`); to make "
+         "`ve activate` work directly, add to your shell rc: "
+         'eval "$(ve shellenv)"')
     return 0
 
 
@@ -329,9 +348,17 @@ def main(argv: list[str] | None = None) -> int:
 
     sp = sub.add_parser(
         "activate",
-        help="activate the env venv (subshell; or eval \"$(ve activate)\")",
+        help="activate the env venv in the current shell "
+             "(needs eval \"$(ve shellenv)\" in your rc)",
     )
     sp.set_defaults(func=cmd_activate)
+
+    sp = sub.add_parser(
+        "shellenv",
+        help="print shell function enabling `ve activate`; "
+             "add to your rc: eval \"$(ve shellenv)\"",
+    )
+    sp.set_defaults(func=cmd_shellenv)
 
     sp = sub.add_parser("sync", help="re-resolve layers for the current worktree HEAD")
     sp.add_argument("--fresh-venv", action="store_true",
