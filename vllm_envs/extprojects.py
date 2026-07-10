@@ -24,7 +24,9 @@ COMMENT_RE = re.compile(r"#[^\n]*")
 DECLARE_RE = re.compile(
     r"FetchContent_(?:Declare|Populate)\s*\(\s*([A-Za-z0-9_\-]+)(.*?)\)", re.I | re.S
 )
-FIELD_RE = re.compile(r'(GIT_REPOSITORY|GIT_TAG)\s+"?([^"\n]+?)"?\s*$', re.M)
+FIELD_RE = re.compile(
+    r'(GIT_REPOSITORY|GIT_TAG|SOURCE_SUBDIR)\s+"?([^"\n]+?)"?\s*$', re.M
+)
 
 
 @dataclass
@@ -33,6 +35,10 @@ class ExtPin:
     repo: str
     tag: str
     submodules: bool
+    # SOURCE_SUBDIR from the declare: the *_SRC_DIR env var must point at the
+    # same subdir the unpinned FetchContent path would use (e.g. triton_kernels
+    # lives under python/triton_kernels/triton_kernels of the triton repo)
+    subdir: str = ""
 
 
 def _resolve(value: str, variables: dict[str, str]) -> str | None:
@@ -72,6 +78,7 @@ def parse_pins(root: Path) -> dict[str, ExtPin]:
                 repo=repo,
                 tag=tag,
                 submodules="GIT_SUBMODULES" in body.upper(),
+                subdir=_resolve(fields.get("SOURCE_SUBDIR", ""), variables) or "",
             )
     return pins
 
@@ -126,7 +133,14 @@ def src_dir_env(cfg: Config, root: Path) -> dict[str, str]:
         if pin is None:
             continue
         try:
-            env[var] = str(ensure_ext_src(cfg, pin))
+            src = ensure_ext_src(cfg, pin)
+            if pin.subdir:
+                src = src / pin.subdir
+                if not src.is_dir():
+                    warn(f"ext-src {name}: subdir {pin.subdir} missing in "
+                         f"{pin.tag}; falling back to FetchContent")
+                    continue
+            env[var] = str(src)
         except Exception as e:  # clone failure → let FetchContent handle it
             warn(f"ext-src {name} unavailable ({e}); falling back to FetchContent")
     return env

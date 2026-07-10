@@ -154,8 +154,11 @@ def resolve_venv(cfg: Config, env_root: Path, fresh: bool = False) -> tuple[Path
             _uninstall_removed_deps(env_root, venv, template)
             update_marker(env_root, venv_full_hash=keys.full_hash, venv_base_hash=keys.base_hash)
             return venv, keys
-        warn("torch/build deps changed across hop → replacing env venv with a "
-             "fresh clone (local site-packages edits are discarded)")
+        if current:
+            warn("torch/build deps changed across hop → replacing env venv with "
+                 "a fresh clone (local site-packages edits are discarded)")
+        else:
+            warn(f"replacing unmanaged venv at {venv} with a ve-managed clone")
 
     template = ensure_full_template(cfg, keys, platform)
     if venv.exists():
