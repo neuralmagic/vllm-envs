@@ -10,7 +10,7 @@ from .locks import release, try_entry_lock
 from .log import say, warn
 from .registry import referenced_build_hashes
 from .store import META_NAME, entry_size, is_pinned, last_used
-from .util import human_size
+from .util import human_size, run
 
 
 @dataclass
@@ -70,6 +70,18 @@ def _evict(c: Candidate, dry_run: bool) -> bool:
         release(fd)
 
 
+def _prune_uv_cache(dry_run: bool) -> None:
+    if shutil.which("uv") is None:
+        return
+    if dry_run:
+        say("would run `uv cache prune`")
+        return
+    # safe: venv hardlinks keep pruned files' data alive; only future
+    # installs pay a re-download
+    say("pruning uv cache")
+    run(["uv", "cache", "prune"], check=False, stream_prefix="[ve]   [uv] ")
+
+
 def run_gc(
     cfg: Config,
     dry_run: bool = False,
@@ -87,6 +99,7 @@ def run_gc(
         target_reclaim = total - cap
     else:
         say("under cap; nothing to do")
+        _prune_uv_cache(dry_run)
         return
 
     # Eviction order: store priority (EVICTION_ORDER), then LRU within store.
@@ -110,3 +123,4 @@ def run_gc(
     if reclaimed < target_reclaim:
         warn("could not reach target: remaining entries are protected "
              "(refcounted, pinned, or inside the min-age window)")
+    _prune_uv_cache(dry_run)
