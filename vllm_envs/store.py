@@ -2,7 +2,7 @@ import json
 import time
 from pathlib import Path
 
-from .util import dir_size_bytes
+from .util import apportioned_size_bytes, dir_size_bytes
 
 META_NAME = "meta.json"
 LAST_USED_NAME = ".last-used"
@@ -40,10 +40,10 @@ def last_used(entry: Path) -> float:
 
 
 def entry_size(entry: Path) -> int:
-    meta = read_meta(entry)
-    if "size_bytes" in meta:
-        return int(meta["size_bytes"])
-    return dir_size_bytes(entry)
+    """Physical apportioned size, computed live: recorded size_bytes goes stale
+    (e.g. the builds/ extracted mirror lands after publish) and logical sizes
+    overcount hardlink sharing — the gc cap enforces physical usage."""
+    return apportioned_size_bytes(entry)
 
 
 def is_pinned(entry: Path) -> bool:

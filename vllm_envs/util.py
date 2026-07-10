@@ -72,6 +72,22 @@ def dir_size_bytes(path: Path) -> int:
     return total
 
 
+def apportioned_size_bytes(path: Path) -> int:
+    """Physical bytes attributed to this tree: st_blocks/st_nlink per file, so
+    hardlink-shared files (uv cache, sibling templates) count a fair share.
+    Reflink-shared extents are still counted once per file (invisible to stat).
+    """
+    total = 0.0
+    for root, _dirs, files in os.walk(path, onerror=lambda e: None):
+        for f in files:
+            try:
+                st = os.lstat(os.path.join(root, f))
+            except OSError:
+                continue
+            total += st.st_blocks * 512 / max(st.st_nlink, 1)
+    return int(total)
+
+
 def human_size(n: float) -> str:
     for unit in ("B", "KB", "MB", "GB", "TB"):
         if abs(n) < 1024 or unit == "TB":

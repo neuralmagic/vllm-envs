@@ -229,18 +229,18 @@ def cmd_du(cfg: Config, args) -> int:
     phys = _du_many(store_paths + related)
     combined = _du_combined(store_paths + related)
 
-    print(f"{'store':14s} {'entries':>7s} {'logical':>10s} {'physical':>10s}")
-    logical_total = phys_total = 0
+    print(f"{'store':14s} {'entries':>7s} {'capped':>10s} {'du':>10s}")
+    capped_total = phys_total = 0
     for store in STORE_NAMES:
         cs = [c for c in candidates if c.store == store]
-        logical = sum(c.size for c in cs)
+        capped = sum(c.size for c in cs)
         physical = phys.get(str(cfg.store(store)), 0)
-        logical_total += logical
+        capped_total += capped
         phys_total += physical
-        print(f"{store:14s} {len(cs):>7d} {human_size(logical):>10s} "
+        print(f"{store:14s} {len(cs):>7d} {human_size(capped):>10s} "
               f"{human_size(physical):>10s}")
-    print(f"{'ve total':14s} {'':>7s} {human_size(logical_total):>10s} "
-          f"{human_size(phys_total):>10s}  (cap {cfg.max_size_gb:.0f}GB on logical)")
+    print(f"{'ve total':14s} {'':>7s} {human_size(capped_total):>10s} "
+          f"{human_size(phys_total):>10s}  (cap {cfg.max_size_gb:.0f}GB)")
 
     print()
     for label, d in (("uv cache", uv_dir), ("ccache", ccache_dir)):
@@ -267,8 +267,9 @@ def cmd_du(cfg: Config, args) -> int:
         print(f"\ndisk free: {human_size(avail)} on {cfg.cache_dir}")
     except (IndexError, ValueError):
         pass
-    print("note: physical = du blocks (hardlinks deduped; reflink-shared "
-          "extents still counted once per file)")
+    print("note: capped = physical blocks apportioned by hardlink count "
+          "(what gc enforces); du = standalone per-store blocks; "
+          "reflink-shared extents count once per file in both")
 
     if args.entries:
         for store in STORE_NAMES:

@@ -36,7 +36,7 @@ git bisect start ...        # works transparently
 ve status                   # layer hashes + cache state
 ve rm bisect1               # for `ve init` envs: unmanages, never deletes your checkout
 ve gc --dry-run             # LRU cache pruning (50GB default cap)
-ve du [--entries]           # usage audit: per store logical vs physical, uv cache/ccache, hardlink sharing, live envs
+ve du [--entries]           # usage audit: per store, uv cache/ccache, hardlink sharing, live envs
 ```
 
 Auto-init on `git worktree add` fires only for worktrees of a repo where the hook is installed (`ve init` or `ve new` installs it); set `VE_NO_AUTO_INIT=1` to skip it for one command.
@@ -67,7 +67,7 @@ Only 1a→1b is a derivation chain (1b templates are reflink-cloned from 1a and 
 
 ```toml
 [cache]
-max_size_gb = 50       # VE_MAX_SIZE_GB overrides
+max_size_gb = 50       # VE_MAX_SIZE_GB overrides; enforced on physical usage (blocks apportioned by hardlink count)
 min_age_hours = 72
 
 [core]
