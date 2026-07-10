@@ -1,8 +1,11 @@
 """Layer resolution: venv templates (1a/1b), compiled extensions (3), attach."""
 
 import os
+import re
 import shutil
+import subprocess
 import time
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -14,7 +17,26 @@ from .log import say, warn
 from .precompiled import try_fetch_precompiled
 from .registry import read_marker, update_marker
 from .store import touch_last_used, write_meta
-from .util import reflink_clone, run
+from .util import human_size, reflink_clone, run
+
+
+def _rewrite_venv_paths(old: Path, new: Path) -> None:
+    """Fix activate scripts / console-script shebangs after cloning a venv."""
+    bin_dir = new / "bin"
+    old_s, new_s = str(old), str(new)
+    if old_s == new_s or not bin_dir.is_dir():
+        return
+    for f in bin_dir.iterdir():
+        if f.is_symlink() or not f.is_file():
+            continue
+        try:
+            text = f.read_text()
+        except (UnicodeDecodeError, OSError):
+            continue
+        if old_s in text:
+            mode = f.stat().st_mode
+            f.write_text(text.replace(old_s, new_s))
+            f.chmod(mode)
 
 
 def _uv_pip(venv: Path, args: list[str], env: dict | None = None) -> None:
@@ -27,6 +49,29 @@ def _uv_pip(venv: Path, args: list[str], env: dict | None = None) -> None:
 
 def _torch_backend_args(platform: str) -> list[str]:
     return ["--torch-backend=auto"] if platform == "cuda" else []
+
+
+def _venv_freeze(venv: Path) -> list[str]:
+    out = run(["uv", "pip", "freeze", "--python", str(venv / "bin" / "python")]).stdout
+    return sorted(line.strip() for line in out.splitlines() if line.strip())
+
+
+def _freeze_names(lines: list[str]) -> set[str]:
+    names = set()
+    for line in lines:
+        if line.startswith(("-", "#")) or "://" in line:
+            continue
+        name = re.split(r"[=<>!\[@; ]", line, maxsplit=1)[0].strip()
+        if name:
+            names.add(name.lower().replace("_", "-"))
+    return names
+
+
+def template_freeze(entry: Path) -> list[str]:
+    f = entry / "freeze.txt"
+    if not f.exists():  # templates predating freeze tracking
+        f.write_text("\n".join(_venv_freeze(entry)) + "\n")
+    return f.read_text().splitlines()
 
 
 # --------------------------------------------------------------------------
@@ -68,12 +113,14 @@ def ensure_full_template(cfg: Config, keys: VenvKeys, platform: str) -> Path:
         if entry.exists():
             shutil.rmtree(entry)
         reflink_clone(base, entry)
+        _rewrite_venv_paths(base, entry)
         (entry / ".complete").unlink(missing_ok=True)
         req_args: list[str] = []
         for f in keys.layout.runtime_files:
             req_args += ["-r", str(f)]
         if req_args:
             _uv_pip(entry, [*req_args, *_torch_backend_args(platform)])
+        (entry / "freeze.txt").write_text("\n".join(_venv_freeze(entry)) + "\n")
         (entry / ".complete").touch()
         write_meta(entry, {"kind": "venv-full", "hash": keys.full_hash, "base": keys.base_hash})
         touch_last_used(entry)
@@ -94,15 +141,17 @@ def resolve_venv(cfg: Config, env_root: Path, fresh: bool = False) -> tuple[Path
 
     if venv.exists() and not fresh:
         if current and marker.get("venv_base_hash") == keys.base_hash:
-            # Base unchanged: converge the private venv in place (top-up).
-            # Keeps agent divergence (debug prints); removed deps linger.
+            # Base unchanged: converge the private venv in place (top-up),
+            # keeping agent divergence (debug prints, extra packages).
             say(f"venv layer: requirements changed → top-up install into env venv "
                 f"({current} → {keys.full_hash})")
+            template = ensure_full_template(cfg, keys, platform)
             req_args: list[str] = []
             for f in keys.layout.runtime_files:
                 req_args += ["-r", str(f)]
             if req_args:
                 _uv_pip(venv, [*req_args, *_torch_backend_args(platform)])
+            _uninstall_removed_deps(env_root, venv, template)
             update_marker(env_root, venv_full_hash=keys.full_hash, venv_base_hash=keys.base_hash)
             return venv, keys
         warn("torch/build deps changed across hop → replacing env venv with a "
@@ -113,10 +162,49 @@ def resolve_venv(cfg: Config, env_root: Path, fresh: bool = False) -> tuple[Path
         shutil.rmtree(venv)
     t0 = time.time()
     reflink_clone(template, venv)
+    _rewrite_venv_paths(template, venv)
+    # heal templates derived before path rewriting existed
+    _rewrite_venv_paths(cfg.store("venvs-base") / keys.base_hash, venv)
     (venv / ".complete").unlink(missing_ok=True)
     say(f"venv layer: reflink-cloned template {keys.full_hash} ({time.time() - t0:.1f}s)")
+    _record_template_freeze(env_root, template_freeze(template))
     update_marker(env_root, venv_full_hash=keys.full_hash, venv_base_hash=keys.base_hash)
     return venv, keys
+
+
+def _freeze_record(env_root: Path) -> Path:
+    return _scratch(env_root) / "template-freeze.txt"
+
+
+def _record_template_freeze(env_root: Path, lines: list[str]) -> None:
+    _freeze_record(env_root).write_text("\n".join(lines) + "\n")
+
+
+def _uninstall_removed_deps(env_root: Path, venv: Path, template: Path) -> None:
+    """Uninstall deps that dropped out of the new template's resolution.
+
+    removed = old template freeze − new template freeze, so user-added
+    packages (in neither freeze) always survive.
+    """
+    record = _freeze_record(env_root)
+    new_lines = template_freeze(template)
+    if record.exists():
+        removed = _freeze_names(record.read_text().splitlines()) - _freeze_names(new_lines)
+        installed = _freeze_names(_venv_freeze(venv))
+        removed &= installed
+        if removed:
+            say(f"venv layer: uninstalling {len(removed)} removed dep(s): "
+                f"{', '.join(sorted(removed))}")
+            run(
+                ["uv", "pip", "uninstall", "--python", str(venv / "bin" / "python"),
+                 *sorted(removed)],
+                check=False,
+                stream_prefix="[ve]   [uv] ",
+            )
+    else:
+        warn("no template freeze record for this env (created pre-freeze-tracking); "
+             "removed deps not uninstalled this hop")
+    _record_template_freeze(env_root, new_lines)
 
 
 # --------------------------------------------------------------------------
@@ -257,6 +345,48 @@ def resolve_build(cfg: Config, env_root: Path, venv: Path) -> BuildResolution:
 # --------------------------------------------------------------------------
 
 
+def _dedupe_extracted_sos(env_root: Path, wheel: Path, store_entry: Path) -> None:
+    """Replace wheel-extracted .so copies in the worktree with reflinks to a
+    shared mirror under builds/<hash>/extracted/.
+
+    XFS CoW: N envs at the same hash share one physical copy until a file is
+    rewritten (e.g. a private rebuild), and envs stay self-contained if the
+    store entry is later evicted. Best-effort: plain copies are kept whenever
+    reflinks are unavailable.
+    """
+    mirror = store_entry / "extracted"
+    with zipfile.ZipFile(wheel) as zf:
+        names = [n for n in zf.namelist() if n.endswith(".so") or ".so." in n]
+    shared_bytes = 0
+    count = 0
+    for name in names:
+        wt = env_root / name
+        if not wt.is_file() or wt.is_symlink():
+            continue
+        m = mirror / name
+        if not m.is_file():
+            m.parent.mkdir(parents=True, exist_ok=True)
+            tmp = m.with_name(m.name + f".tmp{os.getpid()}")
+            shutil.copy2(wt, tmp)
+            tmp.chmod(0o444)
+            os.replace(tmp, m)  # atomic; concurrent attachers write identical bytes
+        tmp = wt.with_name(wt.name + ".ve-reflink")
+        proc = subprocess.run(
+            ["cp", "--reflink=always", str(m), str(tmp)], capture_output=True
+        )
+        if proc.returncode != 0:
+            tmp.unlink(missing_ok=True)
+            return  # non-reflink filesystem: keep plain copies
+        tmp.chmod(0o644)
+        size = wt.stat().st_size
+        os.replace(tmp, wt)
+        shared_bytes += size
+        count += 1
+    if count:
+        say(f"deduped {count} extracted .so files → reflinks of "
+            f"builds/{store_entry.name}/extracted ({human_size(shared_bytes)} shared)")
+
+
 def attach(cfg: Config, env_root: Path, venv: Path, res: BuildResolution) -> None:
     env = {"VLLM_USE_PRECOMPILED": "1"}
     if res.wheel is not None:
@@ -265,6 +395,11 @@ def attach(cfg: Config, env_root: Path, venv: Path, res: BuildResolution) -> Non
     else:
         say("attaching via upstream precompiled wheel fetch + editable install")
     _uv_pip(venv, ["-e", str(env_root), "--no-build-isolation", "--no-deps"], env=env)
+    if res.shared and res.wheel is not None:
+        try:
+            _dedupe_extracted_sos(env_root, res.wheel, cfg.store("builds") / res.build_hash)
+        except Exception as e:
+            warn(f".so dedupe skipped ({e}); worktree keeps plain copies")
     update_marker(
         env_root,
         build_hash=res.build_hash if res.shared else "",

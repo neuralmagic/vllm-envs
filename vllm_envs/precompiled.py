@@ -32,15 +32,36 @@ def _base_main_commit(root: Path) -> str | None:
     return None
 
 
-def _build_inputs_match_base(root: Path, base: str) -> bool:
+def _build_inputs_match(root: Path, commit: str) -> bool:
     try:
         diff = git(
-            ["diff", "--name-only", base, "HEAD", "--", *BUILD_LAYER_PATHS],
+            ["diff", "--name-only", commit, "HEAD", "--", *BUILD_LAYER_PATHS],
             cwd=root,
         )
     except Exception:
         return False
     return not diff.strip()
+
+
+def _candidate_commits(root: Path, limit: int = 10) -> list[str]:
+    """Main ancestors (newest first) whose build inputs are identical to HEAD.
+
+    Starts at the merge-base with main and walks first-parent history until
+    the build inputs diverge — any of these commits' wheels contains the same
+    compiled extensions this tree would build.
+    """
+    base = _base_main_commit(root)
+    if not base:
+        return []
+    ancestors = git(
+        ["rev-list", "--first-parent", "-n", str(limit), base], cwd=root
+    ).splitlines()
+    candidates: list[str] = []
+    for c in ancestors:
+        if not _build_inputs_match(root, c):
+            break
+        candidates.append(c)
+    return candidates
 
 
 def _variant(platform: str) -> str | None:
@@ -80,11 +101,17 @@ def try_fetch_precompiled(cfg: Config, env_root: Path, bhash: str) -> Path | Non
     Returns the wheel path on success, None when unavailable/unsafe. Caller
     holds the entry lock and has verified the tree is clean for build paths.
     """
-    base = _base_main_commit(env_root)
-    if not base or not _build_inputs_match_base(env_root, base):
+    candidates = _candidate_commits(env_root)
+    if not candidates:
         return None
     platform = cfg.platform or "cuda"
-    url = _select_wheel_url(base, _variant(platform))
+    variant = _variant(platform)
+    url = base = None
+    for commit in candidates:
+        url = _select_wheel_url(commit, variant)
+        if url is not None:
+            base = commit
+            break
     if url is None:
         return None
 

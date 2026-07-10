@@ -1,6 +1,8 @@
 import argparse
+import os
 import re
 import shutil
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -9,7 +11,7 @@ from .config import MARKER_NAME, STORE_NAMES, Config, load_config
 from .extprojects import user_overrides
 from .gc import collect_candidates, run_gc, total_size
 from .hashing import build_key, build_paths_dirty, detect_platform, venv_keys
-from .hooks import handle_post_checkout, install_hook
+from .hooks import handle_post_checkout, init_env, install_hook
 from .layers import sync
 from .log import die, say, warn
 from .registry import (
@@ -52,6 +54,7 @@ def cmd_new(cfg: Config, args) -> int:
     run(
         ["git", "worktree", "add", "--detach", str(dest), args.ref],
         cwd=repo,
+        env={"VE_NO_AUTO_INIT": "1"},  # ve new does its own init below
         stream_prefix="[ve]   [git] ",
     )
     install_hook(repo)
@@ -61,6 +64,36 @@ def cmd_new(cfg: Config, args) -> int:
     sync(cfg, dest, fresh_venv=False)
     say(f"env '{name}' ready in {time.time() - t0:.0f}s: {dest}")
     say(f"activate with: source {dest}/.venv/bin/activate")
+    return 0
+
+
+def cmd_init(cfg: Config, args) -> int:
+    root = _repo_root(Path.cwd())
+    if (root / MARKER_NAME).exists():
+        die(f"already a ve-managed env: {root} (use `ve sync`)")
+    if not (root / "setup.py").exists():
+        warn(f"{root} does not look like a vLLM checkout (no setup.py)")
+    t0 = time.time()
+    name = init_env(cfg, root, args.name)
+    say(f"env '{name}' ready in {time.time() - t0:.0f}s: {root}")
+    say('activate with: ve activate  (or eval "$(ve activate)" in scripts)')
+    return 0
+
+
+def cmd_activate(cfg: Config, args) -> int:
+    root = _env_root_from_cwd()
+    activate = root / ".venv" / "bin" / "activate"
+    if not activate.exists():
+        die(f"no venv at {root / '.venv'} — run `ve sync`")
+    if sys.stdout.isatty():
+        venv = root / ".venv"
+        say(f"activating {venv} in a subshell (exit to leave)")
+        env = dict(os.environ)
+        env["VIRTUAL_ENV"] = str(venv)
+        env["PATH"] = f"{venv / 'bin'}{os.pathsep}{env.get('PATH', '')}"
+        env.pop("PYTHONHOME", None)
+        return subprocess.call([os.environ.get("SHELL", "/bin/bash")], env=env)
+    print(f"source {activate}")
     return 0
 
 
@@ -76,6 +109,12 @@ def cmd_rm(cfg: Config, args) -> int:
         die(f"unknown env '{args.name}' (known: {', '.join(sorted(envs)) or 'none'})")
     dest = envs[args.name]
     repo = Path(read_marker(dest).get("repo", ""))
+    if str(repo) and repo.resolve() == dest.resolve():
+        say(f"'{args.name}' is an in-place env (ve init): unmanaging, "
+            "leaving the checkout intact")
+        (dest / MARKER_NAME).unlink(missing_ok=True)
+        unregister_env(cfg, args.name)
+        return 0
     say(f"removing env '{args.name}' at {dest}")
     if repo.is_dir():
         run(
@@ -182,6 +221,18 @@ def main(argv: list[str] | None = None) -> int:
     sp.add_argument("--name", "-n")
     sp.add_argument("--repo", help="path to the vLLM clone (default: cwd)")
     sp.set_defaults(func=cmd_new)
+
+    sp = sub.add_parser(
+        "init", help="manage the current checkout/worktree in place (build + venv)"
+    )
+    sp.add_argument("--name", "-n", help="env name (default: directory name)")
+    sp.set_defaults(func=cmd_init)
+
+    sp = sub.add_parser(
+        "activate",
+        help="activate the env venv (subshell; or eval \"$(ve activate)\")",
+    )
+    sp.set_defaults(func=cmd_activate)
 
     sp = sub.add_parser("sync", help="re-resolve layers for the current worktree HEAD")
     sp.add_argument("--fresh-venv", action="store_true",
