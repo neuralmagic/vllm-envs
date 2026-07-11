@@ -166,6 +166,104 @@ def cmd_list(cfg: Config, args) -> int:
     return 0
 
 
+def _reap_repo(cfg: Config) -> Path:
+    try:
+        return _repo_root(Path.cwd())
+    except SystemExit:
+        for path in live_envs(cfg).values():
+            repo = Path(read_marker(path).get("repo", "")) or path
+            if (repo / ".git").exists():
+                return repo
+        die("not inside a git repo; run `ve reap` from a repo checkout")
+        raise
+
+
+def _print_worktrees(wts: list) -> None:
+    from .worktrees import age_str
+
+    order = {"archived": 0, "deleted": 0, "orphan": 1, "active": 2,
+             "external": 3, "primary": 4}
+    wts = sorted(wts, key=lambda w: (order.get(w.state, 9), -(w.activity or 0)))
+    print(f"{'worktree':22s} {'state':9s} {'act':>4s} {'tree':>6s} "
+          f"{'sync':>8s} {'reap':16s} branch")
+    n_safe = n_cand = 0
+    for w in wts:
+        tree = "clean" if not w.dirty else f"{w.dirty}drt"
+        if w.is_candidate:
+            n_cand += 1
+            safe, reason = w.safety()
+            n_safe += safe
+            reap = "SAFE" if safe else f"blocked:{reason.split()[0]}"
+        else:
+            reap = "-"
+        print(f"{w.path.name:22s} {w.state:9s} {age_str(w.activity):>4s} "
+              f"{tree:>6s} {w.sync:>8s} {reap:16s} {w.branch[:40]}")
+    print(f"\n{n_cand} stale ({n_safe} safe to reap). "
+          "reap all safe: `ve reap --stale`  |  one: `ve reap <name>`  |  "
+          "override gate: --force")
+
+
+def _reap_one(cfg: Config, w, envs: dict, dry_run: bool) -> bool:
+    from .worktrees import age_str
+
+    label = f"{w.path.name} [{w.state}] {w.branch} (last active {age_str(w.activity)})"
+    if dry_run:
+        say(f"would reap {label}")
+        return True
+    say(f"reaping {label}")
+    repo = Path(read_marker(w.path).get("repo", "")) if w.path.exists() else None
+    run(["git", "worktree", "remove", "--force", str(w.path)],
+        cwd=repo or Path.cwd(), check=False)
+    if w.path.exists():
+        shutil.rmtree(w.path, ignore_errors=True)
+    for name, path in envs.items():
+        if path.resolve() == w.path.resolve():
+            unregister_env(cfg, name)
+    run(["git", "worktree", "prune"], cwd=Path.cwd(), check=False)
+    return True
+
+
+def cmd_reap(cfg: Config, args) -> int:
+    from .worktrees import collect
+
+    repo = _reap_repo(cfg)
+    wts = collect(repo)
+    if not args.targets and not args.stale:
+        _print_worktrees(wts)
+        return 0
+
+    if args.stale:
+        selected = [w for w in wts if w.is_candidate]
+    else:
+        index: dict[str, object] = {}
+        for w in wts:
+            index[w.path.name] = w
+            index[str(w.path)] = w
+        selected = []
+        for t in args.targets:
+            w = index.get(t) or index.get(str(Path(t).expanduser().resolve()))
+            if w is None:
+                warn(f"no worktree matching '{t}'")
+            else:
+                selected.append(w)
+
+    envs = live_envs(cfg)
+    reaped = 0
+    for w in selected:
+        if not w.is_candidate and not args.force:
+            warn(f"skip {w.path.name} [{w.state}] — not a stale t3 worktree "
+                 "(active/primary/external); use --force to override")
+            continue
+        safe, reason = w.safety()
+        if not safe and not args.force:
+            warn(f"skip {w.path.name} — {reason}; commit/push or use --force")
+            continue
+        reaped += _reap_one(cfg, w, envs, dry_run=args.dry_run)
+    verb = "would reap" if args.dry_run else "reaped"
+    say(f"{verb} {reaped} worktree(s)")
+    return 0
+
+
 def cmd_status(cfg: Config, args) -> int:
     root = _env_root_from_cwd()
     m = read_marker(root)
@@ -397,6 +495,18 @@ def main(argv: list[str] | None = None) -> int:
 
     sp = sub.add_parser("status", help="show env layer hashes and cache state")
     sp.set_defaults(func=cmd_status)
+
+    sp = sub.add_parser(
+        "reap",
+        help="list worktrees; reap stale (archived/deleted) t3code ones",
+    )
+    sp.add_argument("targets", nargs="*", help="worktree name(s) or path(s) to reap")
+    sp.add_argument("--stale", action="store_true",
+                    help="reap all archived/deleted/orphan worktrees")
+    sp.add_argument("--force", action="store_true",
+                    help="bypass the clean+pushed safety gate")
+    sp.add_argument("--dry-run", action="store_true", help="show what would be reaped")
+    sp.set_defaults(func=cmd_reap)
 
     sp = sub.add_parser("gc", help="prune caches (LRU, 50GB default cap)")
     sp.add_argument("--dry-run", action="store_true")
