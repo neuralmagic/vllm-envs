@@ -8,6 +8,7 @@ from pathlib import Path
 
 from .config import MARKER_NAME, STORE_NAMES, Config, load_config
 from .extprojects import user_overrides
+from .fiemap import reflink_usage
 from .gc import collect_candidates, run_gc, total_size
 from .hashing import build_key, build_paths_dirty, detect_platform, venv_keys
 from .hooks import handle_post_checkout, init_env, install_hook
@@ -244,9 +245,15 @@ def cmd_du(cfg: Config, args) -> int:
         ccache_dir = Path(p.stdout.strip())
     related = [d for d in (uv_dir, ccache_dir) if d is not None]
 
-    say("measuring disk usage (du over caches — may take a minute)...")
+    envs = live_envs(cfg)
+    say("measuring disk usage (du + reflink extent scan — may take a minute)...")
     phys = _du_many(store_paths + related)
     combined = _du_combined(store_paths + related)
+
+    groups: dict[str, list[Path]] = {s: [cfg.store(s)] for s in STORE_NAMES}
+    for name, path in envs.items():
+        groups[f"env:{name}"] = [path / ".venv"]
+    usage = reflink_usage(groups)
 
     print(f"{'store':14s} {'entries':>7s} {'capped':>10s} {'du':>10s}")
     capped_total = phys_total = 0
@@ -271,14 +278,17 @@ def cmd_du(cfg: Config, args) -> int:
     shared = max(all_individual - combined, 0)
     print(f"{'combined':14s} {human_size(combined):>18s}  "
           f"(hardlink-shared across the above: {human_size(shared)})")
+    if usage.supported:
+        print(f"{'physical':14s} {human_size(usage.unique_total):>18s}  "
+              "(reflink-aware: unique on-disk blocks, ve stores + live envs)")
 
-    envs = live_envs(cfg)
     if envs:
         print()
-        env_phys = _du_many([path / ".venv" for path in envs.values()])
         for name, path in sorted(envs.items()):
-            sz = env_phys.get(str(path / ".venv"), 0)
-            print(f"env {name:20s} {human_size(sz):>10s}  {path}/.venv")
+            sz = usage.apparent.get(f"env:{name}", 0)
+            excl = usage.exclusive.get(f"env:{name}", 0)
+            excl_col = f" excl {human_size(excl):>9s}" if usage.supported else ""
+            print(f"env {name:20s} {human_size(sz):>10s}{excl_col}  {path}/.venv")
 
     p = run(["df", "-B1", "--output=avail", str(cfg.cache_dir)], check=False)
     try:
@@ -287,8 +297,9 @@ def cmd_du(cfg: Config, args) -> int:
     except (IndexError, ValueError):
         pass
     print("note: capped = physical blocks apportioned by hardlink count "
-          "(what gc enforces); du = standalone per-store blocks; "
-          "reflink-shared extents count once per file in both")
+          "(what gc enforces); du = standalone per-store blocks (reflink-shared "
+          "extents counted per-file); physical/excl = reflink-aware unique "
+          "blocks (excl = bytes reclaimed if that env alone is deleted)")
 
     if args.entries:
         for store in STORE_NAMES:
