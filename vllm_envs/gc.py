@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .config import EVICTION_ORDER, Config
+from .fiemap import reflink_usage
 from .locks import release, try_entry_lock
 from .log import say, warn
 from .registry import referenced_build_hashes
@@ -88,9 +89,23 @@ def run_gc(
     free_gb: float | None = None,
 ) -> None:
     candidates = collect_candidates(cfg)
-    total = total_size(candidates)
+
+    # Enforce the cap on real on-disk size: stores are heavily reflinked, so the
+    # logical sum wildly overcounts. `phys[key]` is the physical bytes an entry's
+    # eviction actually frees (extents not shared with any other entry).
+    def key(c: Candidate) -> str:
+        return f"{c.store}/{c.entry.name}"
+
+    usage = reflink_usage({key(c): [c.entry] for c in candidates})
+    if usage.supported:
+        total = usage.unique_total
+        phys = usage.exclusive
+    else:  # non-reflink filesystem: physical == logical
+        total = total_size(candidates)
+        phys = {key(c): c.size for c in candidates}
+
     cap = cfg.max_size_gb * 1024**3
-    say(f"cache size: {human_size(total)} / cap {human_size(cap)} "
+    say(f"cache size: {human_size(total)} physical / cap {human_size(cap)} "
         f"({len(candidates)} entries)")
 
     if free_gb is not None:
@@ -117,7 +132,7 @@ def run_gc(
         if reclaimed >= target_reclaim:
             break
         if _evict(c, dry_run):
-            reclaimed += c.size
+            reclaimed += phys.get(key(c), 0)
     verb = "would reclaim" if dry_run else "reclaimed"
     say(f"{verb} {human_size(reclaimed)} (target {human_size(target_reclaim)})")
     if reclaimed < target_reclaim:

@@ -11,7 +11,12 @@ from .extprojects import user_overrides
 from .fiemap import reflink_usage
 from .gc import collect_candidates, run_gc, total_size
 from .hashing import build_key, build_paths_dirty, detect_platform, venv_keys
-from .hooks import handle_post_checkout, init_env, install_hook
+from .hooks import (
+    handle_post_checkout,
+    handle_post_rewrite,
+    init_env,
+    install_hook,
+)
 from .layers import sync
 from .log import die, say, warn
 from .registry import (
@@ -269,7 +274,7 @@ def cmd_du(cfg: Config, args) -> int:
         store_total += logical.get(store, 0)
         print(row(store, str(n), store))
     print(f"  {'subtotal':18s} {'':>7s} {human_size(store_total):>10s}"
-          f"   (gc cap {cfg.max_size_gb:.0f}GB, enforced on logical)")
+          f"   (logical; gc cap {cfg.max_size_gb:.0f}GB enforced on physical)")
 
     if envs:
         print("\nlive envs")
@@ -337,9 +342,13 @@ def cmd_pin(cfg: Config, args) -> int:
 
 
 def cmd_hook(cfg: Config, args) -> int:
-    if args.event != "post-checkout":
-        return 0
-    return handle_post_checkout(cfg, args.old, args.new, args.flag)
+    rest = args.rest
+    if args.event == "post-checkout":
+        old, new, flag = (rest + ["", "", ""])[:3]
+        return handle_post_checkout(cfg, old, new, flag)
+    if args.event == "post-rewrite":
+        return handle_post_rewrite(cfg, rest[0] if rest else "")
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -409,9 +418,7 @@ def main(argv: list[str] | None = None) -> int:
 
     sp = sub.add_parser("hook", help=argparse.SUPPRESS)
     sp.add_argument("event")
-    sp.add_argument("old")
-    sp.add_argument("new")
-    sp.add_argument("flag")
+    sp.add_argument("rest", nargs="*")
     sp.set_defaults(func=cmd_hook)
 
     args = p.parse_args(argv)

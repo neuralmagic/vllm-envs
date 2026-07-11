@@ -31,7 +31,7 @@ EXT_PROJECT_ENV_VARS = {
 class Config:
     cache_dir: Path = DEFAULT_CACHE_DIR
     envs_root: Path = DEFAULT_ENVS_ROOT
-    max_size_gb: float = 50.0
+    max_size_gb: float = 100.0
     min_age_hours: float = 72.0
     python: str = "3.12"
     platform: str = ""  # auto-detect when empty
