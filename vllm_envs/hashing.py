@@ -6,6 +6,8 @@ their own keys and can never collide with clean-commit artifacts.
 """
 
 import hashlib
+import json
+import os
 import re
 import subprocess
 from dataclasses import dataclass
@@ -13,7 +15,7 @@ from functools import lru_cache
 from pathlib import Path
 from shutil import which
 
-from .config import BUILD_LAYER_PATHS
+from .config import BUILD_LAYER_PATHS, DEFAULT_CACHE_DIR
 from .util import run
 
 TORCH_PIN_RE = re.compile(r"^(torch|torchaudio|torchvision|nvidia-|triton)", re.I)
@@ -28,15 +30,40 @@ def detect_platform() -> str:
     return "cpu"
 
 
-@lru_cache(maxsize=8)
+def _cuda_cache_file() -> Path:
+    root = Path(os.environ.get("VE_CACHE_DIR") or DEFAULT_CACHE_DIR)
+    return root / "cuda-version.json"
+
+
+@lru_cache(maxsize=1)
 def cuda_version() -> str:
+    # nvidia-smi costs ~0.8s per run — cache on disk keyed by the driver line
+    try:
+        driver = Path("/proc/driver/nvidia/version").read_text().splitlines()[0]
+    except (OSError, IndexError):
+        driver = ""
+    cache = _cuda_cache_file()
+    if driver:
+        try:
+            data = json.loads(cache.read_text())
+            if data.get("driver") == driver and data.get("cuda"):
+                return data["cuda"]
+        except (OSError, json.JSONDecodeError):
+            pass
+    ver = "unknown"
     try:
         out = run(["nvidia-smi"], check=False).stdout
         if m := re.search(r"CUDA Version:\s*(\d+\.\d+)", out):
-            return m.group(1)
+            ver = m.group(1)
     except Exception:
         pass
-    return "unknown"
+    if driver and ver != "unknown":
+        try:
+            cache.parent.mkdir(parents=True, exist_ok=True)
+            cache.write_text(json.dumps({"driver": driver, "cuda": ver}))
+        except OSError:
+            pass
+    return ver
 
 
 def _sha(parts: list[str]) -> str:
@@ -102,6 +129,46 @@ def requirements_layout(root: Path, platform: str, with_test: bool = False) -> R
     return ReqLayout(all_reqs, all_reqs, recognized=False)
 
 
+_REQ_NAME_RE = re.compile(r"^([A-Za-z0-9][A-Za-z0-9._-]*)")
+_FLOOR_RE = re.compile(r">=?\s*v?(\d+(?:\.\d+)*)")
+_CEILING_RE = re.compile(r"<|==|~=")
+
+
+def cap_constraints(files: list[Path], mode: str) -> str:
+    """Constraint lines capping requirements that have a version floor but no
+    ceiling: `pkg>=X.Y.Z` → `pkg<X.(Y+1)` (minor) or `pkg<(X+1)` (major), so
+    unpinned deps resolve near the floor's era instead of to latest. The
+    highest floor wins when a package appears in several files."""
+    if mode == "none":
+        return ""
+    floors: dict[str, tuple[tuple[int, ...], str]] = {}
+    for f in files:
+        for raw in f.read_text(errors="replace").splitlines():
+            line = raw.split("#", 1)[0].strip()
+            if not line or line.startswith("-") or "://" in line:
+                continue
+            spec = line.split(";", 1)[0].strip()
+            m = _REQ_NAME_RE.match(spec)
+            if not m:
+                continue
+            name, rest = m.group(1), spec[len(m.group(1)):]
+            if _CEILING_RE.search(rest):
+                continue
+            fm = _FLOOR_RE.search(rest)
+            if not fm:
+                continue
+            floor = tuple(int(x) for x in fm.group(1).split("."))
+            key = name.lower().replace("_", "-")
+            if key not in floors or floor > floors[key][0]:
+                floors[key] = (floor, name)
+    lines = []
+    for _, (floor, name) in sorted(floors.items()):
+        parts = [*floor, 0, 0]
+        bound = f"{parts[0] + 1}" if mode == "major" else f"{parts[0]}.{parts[1] + 1}"
+        lines.append(f"{name}<{bound}\n")
+    return "".join(lines)
+
+
 def torch_pin_lines(files: list[Path]) -> list[str]:
     lines = []
     for f in files:
@@ -119,7 +186,8 @@ class VenvKeys:
 
 
 def venv_keys(
-    root: Path, platform: str, python: str, with_test: bool = False
+    root: Path, platform: str, python: str, with_test: bool = False,
+    cap: str = "minor",
 ) -> VenvKeys:
     layout = requirements_layout(root, platform, with_test)
     cuda = cuda_version() if platform == "cuda" else "n/a"
@@ -128,6 +196,8 @@ def venv_keys(
         platform,
         python,
         cuda,
+        # cap="none" stays un-folded so pre-capping templates keep their keys
+        *([f"cap:{cap}"] if cap != "none" else []),
         *(f"{p.name}:{_hash_file(p)}" for p in layout.build_files),
         # torch pins from runtime files fold into the base key so a torch bump
         # rebuilds the base template instead of a heavy top-up in the full layer
