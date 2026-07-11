@@ -164,7 +164,7 @@ def cmd_status(cfg: Config, args) -> int:
     root = _env_root_from_cwd()
     m = read_marker(root)
     platform = cfg.platform or detect_platform()
-    keys = venv_keys(root, platform, cfg.python)
+    keys = venv_keys(root, platform, cfg.python, cap=cfg.cap)
     bhash = build_key(root, platform, cfg.python)
     head = git(["rev-parse", "--short", "HEAD"], cwd=root)
     overrides = user_overrides()

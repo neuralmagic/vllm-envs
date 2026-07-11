@@ -97,6 +97,9 @@ min_age_hours = 72
 [core]
 envs_root = "~/vllm-envs"   # VE_ENVS_ROOT overrides
 python = "3.12"
+
+[venv]
+cap = "minor"   # cap unpinned requirement floors: minor | major | none (VE_CAP overrides)
 ```
 
 Env vars: `VE_CACHE_DIR`, `VE_NO_SYNC=1` (skip hook sync, warn instead).
@@ -105,4 +108,4 @@ Env vars: `VE_CACHE_DIR`, `VE_NO_SYNC=1` (skip hook sync, warn instead).
 
 - Requirements top-up on commit hop converges the env venv (installs the delta, uninstalls deps dropped from the template resolution); user-added packages survive, but for a guaranteed-clean venv use `ve sync --fresh-venv`.
 - The upstream precompiled-wheel fallback (`VLLM_USE_PRECOMPILED`) is used when a local build fails; those artifacts are not captured into the store.
-- Old refs resolve historically-correct *pins*, but unpinned transitive deps (e.g. transformers ranges) resolve to current versions, which can break serving on old releases — that's a vLLM requirements property, not an env-tool one.
+- Unpinned requirement floors (e.g. `transformers>=4.5`) are capped near their era at resolve time: by default each floored-but-uncapped requirement gets an upper bound at the next minor (`>=4.5` → `<4.6`); `cap = "major"` bounds at the next major, `"none"` restores resolve-to-latest. When the caps are mutually unsatisfiable (stale floors), ve automatically falls back minor → major → none with a warning. The cap mode folds into the venv template key.

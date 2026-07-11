@@ -12,7 +12,14 @@ from pathlib import Path
 from . import editable
 from .config import SCRATCH_DIR_NAME, Config
 from .extprojects import src_dir_env, user_overrides
-from .hashing import VenvKeys, build_key, build_paths_dirty, detect_platform, venv_keys
+from .hashing import (
+    VenvKeys,
+    build_key,
+    build_paths_dirty,
+    cap_constraints,
+    detect_platform,
+    venv_keys,
+)
 from .locks import entry_lock
 from .log import say, warn
 from .precompiled import try_fetch_precompiled
@@ -50,6 +57,40 @@ def _uv_pip(venv: Path, args: list[str], env: dict | None = None) -> None:
 
 def _torch_backend_args(platform: str) -> list[str]:
     return ["--torch-backend=auto"] if platform == "cuda" else []
+
+
+_CAP_FALLBACK = {"minor": "major", "major": "none"}
+
+
+def _install_reqs(
+    cfg: Config, keys: VenvKeys, venv: Path, req_args: list[str],
+    platform: str, cap_dest: Path,
+) -> None:
+    """Install requirements with cap constraints, walking down the fallback
+    chain (minor → major → none) when caps make resolution unsatisfiable —
+    stale floors (e.g. tokenizers>=0.21 vs transformers needing >=0.22) can
+    conflict under tight caps."""
+    mode = cfg.cap
+    while True:
+        content = cap_constraints(
+            [*keys.layout.build_files, *keys.layout.runtime_files], mode
+        )
+        cap_args = []
+        if content:
+            cap_dest.write_text(content)
+            cap_args = ["-c", str(cap_dest)]
+        else:
+            cap_dest.unlink(missing_ok=True)
+        try:
+            _uv_pip(venv, [*req_args, *cap_args, *_torch_backend_args(platform)])
+            return
+        except subprocess.CalledProcessError:
+            nxt = _CAP_FALLBACK.get(mode)
+            if not cap_args or nxt is None:
+                raise
+            warn(f"venv layer: cap={mode} constraints unsatisfiable → "
+                 f"retrying with cap={nxt}")
+            mode = nxt
 
 
 def _venv_freeze(venv: Path) -> list[str]:
@@ -95,7 +136,8 @@ def ensure_base_template(cfg: Config, keys: VenvKeys, platform: str) -> Path:
         for f in keys.layout.build_files:
             req_args += ["-r", str(f)]
         if req_args:
-            _uv_pip(entry, [*req_args, *_torch_backend_args(platform)])
+            _install_reqs(cfg, keys, entry, req_args, platform,
+                          entry / "constraints.txt")
         (entry / ".complete").touch()
         write_meta(entry, {"kind": "venv-base", "hash": keys.base_hash})
         touch_last_used(entry)
@@ -120,7 +162,8 @@ def ensure_full_template(cfg: Config, keys: VenvKeys, platform: str) -> Path:
         for f in keys.layout.runtime_files:
             req_args += ["-r", str(f)]
         if req_args:
-            _uv_pip(entry, [*req_args, *_torch_backend_args(platform)])
+            _install_reqs(cfg, keys, entry, req_args, platform,
+                          entry / "constraints.txt")
         (entry / "freeze.txt").write_text("\n".join(_venv_freeze(entry)) + "\n")
         (entry / ".complete").touch()
         write_meta(entry, {"kind": "venv-full", "hash": keys.full_hash, "base": keys.base_hash})
@@ -131,7 +174,7 @@ def ensure_full_template(cfg: Config, keys: VenvKeys, platform: str) -> Path:
 def resolve_venv(cfg: Config, env_root: Path, fresh: bool = False) -> tuple[Path, VenvKeys]:
     """Ensure env_root/.venv matches the worktree's requirements."""
     platform = cfg.platform or detect_platform()
-    keys = venv_keys(env_root, platform, cfg.python)
+    keys = venv_keys(env_root, platform, cfg.python, cap=cfg.cap)
     venv = env_root / ".venv"
     marker = read_marker(env_root)
     current = marker.get("venv_full_hash")
@@ -151,7 +194,8 @@ def resolve_venv(cfg: Config, env_root: Path, fresh: bool = False) -> tuple[Path
             for f in keys.layout.runtime_files:
                 req_args += ["-r", str(f)]
             if req_args:
-                _uv_pip(venv, [*req_args, *_torch_backend_args(platform)])
+                _install_reqs(cfg, keys, venv, req_args, platform,
+                              _scratch(env_root) / "constraints.txt")
             _uninstall_removed_deps(env_root, venv, template)
             update_marker(env_root, venv_full_hash=keys.full_hash, venv_base_hash=keys.base_hash)
             return venv, keys
