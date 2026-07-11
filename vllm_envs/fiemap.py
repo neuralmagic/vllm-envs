@@ -99,7 +99,7 @@ def reflink_usage(groups: dict[str, Iterable[Path]]) -> ReflinkUsage:
     supported = False
 
     for gid, (name, roots) in enumerate(groups.items()):
-        seen: set[tuple[int, int]] = set()  # dedupe hardlinks within this group
+        seen_inodes: set[tuple[int, int]] = set()  # dedupe hardlinks (like du)
         for root in roots:
             for dirpath, _dirs, files in os.walk(root):
                 for fname in files:
@@ -114,13 +114,15 @@ def reflink_usage(groups: dict[str, Iterable[Path]]) -> ReflinkUsage:
                         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
                     except OSError:
                         continue
+                    ino = (st.st_dev, st.st_ino)
+                    new_inode = ino not in seen_inodes
+                    seen_inodes.add(ino)
                     try:
                         for physical, ext_len in _extents(fd):
                             supported = True
                             key = (st.st_dev, physical)
                             length[key] = ext_len
-                            if key not in seen:
-                                seen.add(key)
+                            if new_inode:  # apparent == du: reflinks counted per file
                                 apparent[name] += ext_len
                             prev = owner.get(key)
                             if prev is None:

@@ -216,18 +216,6 @@ def _du_many(paths: list[Path]) -> dict[str, int]:
     return out
 
 
-def _du_combined(paths: list[Path]) -> int:
-    """One du over all paths: hardlinks deduped across them (true footprint)."""
-    existing = [str(p) for p in paths if p.is_dir()]
-    if not existing:
-        return 0
-    proc = run(["du", "-scB1", *existing], check=False)
-    for line in proc.stdout.splitlines():
-        if line.endswith("\ttotal"):
-            return int(line.split()[0])
-    return 0
-
-
 def _age(ts: float) -> str:
     h = (time.time() - ts) / 3600
     return f"{h:.1f}h" if h < 48 else f"{h / 24:.1f}d"
@@ -235,7 +223,6 @@ def _age(ts: float) -> str:
 
 def cmd_du(cfg: Config, args) -> int:
     candidates = collect_candidates(cfg)
-    store_paths = [cfg.store(s) for s in STORE_NAMES]
     uv_dir = ccache_dir = None
     p = run(["uv", "cache", "dir"], check=False)
     if p.returncode == 0 and p.stdout.strip():
@@ -243,52 +230,69 @@ def cmd_du(cfg: Config, args) -> int:
     p = run(["ccache", "--get-config", "cache_dir"], check=False)
     if p.returncode == 0 and p.stdout.strip():
         ccache_dir = Path(p.stdout.strip())
-    related = [d for d in (uv_dir, ccache_dir) if d is not None]
 
     envs = live_envs(cfg)
-    say("measuring disk usage (du + reflink extent scan — may take a minute)...")
-    phys = _du_many(store_paths + related)
-    combined = _du_combined(store_paths + related)
-
+    say("measuring disk usage (reflink extent scan — may take a minute)...")
     groups: dict[str, list[Path]] = {s: [cfg.store(s)] for s in STORE_NAMES}
     for name, path in envs.items():
         groups[f"env:{name}"] = [path / ".venv"]
     usage = reflink_usage(groups)
 
-    print(f"{'store':14s} {'entries':>7s} {'capped':>10s} {'du':>10s}")
-    capped_total = phys_total = 0
-    for store in STORE_NAMES:
-        cs = [c for c in candidates if c.store == store]
-        capped = sum(c.size for c in cs)
-        physical = phys.get(str(cfg.store(store)), 0)
-        capped_total += capped
-        phys_total += physical
-        print(f"{store:14s} {len(cs):>7d} {human_size(capped):>10s} "
-              f"{human_size(physical):>10s}")
-    print(f"{'ve total':14s} {'':>7s} {human_size(capped_total):>10s} "
-          f"{human_size(phys_total):>10s}  (cap {cfg.max_size_gb:.0f}GB)")
-
-    print()
-    for label, d in (("uv cache", uv_dir), ("ccache", ccache_dir)):
-        if d is None:
-            print(f"{label:14s} {'—':>18s}  (not found)")
-        else:
-            print(f"{label:14s} {human_size(phys.get(str(d), 0)):>18s}  {d}")
-    all_individual = phys_total + sum(phys.get(str(d), 0) for d in related)
-    shared = max(all_individual - combined, 0)
-    print(f"{'combined':14s} {human_size(combined):>18s}  "
-          f"(hardlink-shared across the above: {human_size(shared)})")
     if usage.supported:
-        print(f"{'physical':14s} {human_size(usage.unique_total):>18s}  "
-              "(reflink-aware: unique on-disk blocks, ve stores + live envs)")
+        logical = dict(usage.apparent)
+    else:  # non-reflink filesystem: fall back to plain du for apparent sizes
+        du = _du_many(
+            [cfg.store(s) for s in STORE_NAMES]
+            + [path / ".venv" for path in envs.values()]
+        )
+        logical = {s: du.get(str(cfg.store(s)), 0) for s in STORE_NAMES}
+        for name, path in envs.items():
+            logical[f"env:{name}"] = du.get(str(path / ".venv"), 0)
+
+    def row(name: str, entries: str, key: str) -> str:
+        line = f"  {name:18s} {entries:>7s} {human_size(logical.get(key, 0)):>10s}"
+        if usage.supported:
+            excl = usage.exclusive.get(key, 0)
+            line += f" {human_size(excl):>10s}"
+        return line
+
+    head = f"  {'':18s} {'entries':>7s} {'logical':>10s}"
+    if usage.supported:
+        head += f" {'excl':>10s}"
+
+    print("stores")
+    print(head)
+    stores = sorted(STORE_NAMES, key=lambda s: -logical.get(s, 0))
+    store_total = 0
+    for store in stores:
+        n = sum(1 for c in candidates if c.store == store)
+        store_total += logical.get(store, 0)
+        print(row(store, str(n), store))
+    print(f"  {'subtotal':18s} {'':>7s} {human_size(store_total):>10s}"
+          f"   (gc cap {cfg.max_size_gb:.0f}GB, enforced on logical)")
 
     if envs:
-        print()
-        for name, path in sorted(envs.items()):
-            sz = usage.apparent.get(f"env:{name}", 0)
-            excl = usage.exclusive.get(f"env:{name}", 0)
-            excl_col = f" excl {human_size(excl):>9s}" if usage.supported else ""
-            print(f"env {name:20s} {human_size(sz):>10s}{excl_col}  {path}/.venv")
+        print("\nlive envs")
+        print(head)
+        for name in sorted(envs):
+            print(row(name, "", f"env:{name}"))
+
+    if usage.supported:
+        excl_sum = sum(usage.exclusive.values())
+        shared = max(usage.unique_total - excl_sum, 0)
+        print(f"\nphysical (stores + envs, unique) {human_size(usage.unique_total):>10s}")
+        print(f"  exclusive to one item          {human_size(excl_sum):>10s}")
+        print(f"  shared across items            {human_size(shared):>10s}")
+
+    print()
+    cache_dirs = [d for d in (uv_dir, ccache_dir) if d is not None]
+    cache_du = _du_many(cache_dirs)
+    for label, d in (("uv cache", uv_dir), ("ccache", ccache_dir)):
+        if d is None:
+            print(f"{label:10s} {'—':>10s}  (not found)")
+        else:
+            note = "  (separate; reflink source)" if label == "uv cache" else ""
+            print(f"{label:10s} {human_size(cache_du.get(str(d), 0)):>10s}  {d}{note}")
 
     p = run(["df", "-B1", "--output=avail", str(cfg.cache_dir)], check=False)
     try:
@@ -296,10 +300,9 @@ def cmd_du(cfg: Config, args) -> int:
         print(f"\ndisk free: {human_size(avail)} on {cfg.cache_dir}")
     except (IndexError, ValueError):
         pass
-    print("note: capped = physical blocks apportioned by hardlink count "
-          "(what gc enforces); du = standalone per-store blocks (reflink-shared "
-          "extents counted per-file); physical/excl = reflink-aware unique "
-          "blocks (excl = bytes reclaimed if that env alone is deleted)")
+    print("note: logical = apparent size (du; reflink-shared blocks counted per "
+          "file); physical = real on-disk blocks, each extent counted once; "
+          "excl = freed if that item alone is deleted")
 
     if args.entries:
         for store in STORE_NAMES:
