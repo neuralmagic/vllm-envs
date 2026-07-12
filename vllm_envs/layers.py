@@ -47,6 +47,32 @@ def _rewrite_venv_paths(old: Path, new: Path) -> None:
             f.chmod(mode)
 
 
+def invalidate_env(env_root: Path) -> None:
+    """Remove an incompatible private venv after a failed synchronization.
+
+    A branch switch can cross an extension ABI boundary even when Git's
+    post-checkout hook cannot complete dependency resolution.  A ve-managed
+    venv is a disposable clone of cached layers, so retaining it would make the
+    new source run against stale compiled ops.  Clearing both the clone and its
+    marker makes that state fail closed; the next successful ``ve sync`` creates
+    a matching clone from the shared cache.
+    """
+    venv = env_root / ".venv"
+    if venv.is_symlink():
+        venv.unlink()
+        warn("removed stale .venv; run `ve sync` to create a matching environment")
+    elif venv.exists():
+        shutil.rmtree(venv)
+        warn("removed stale .venv; run `ve sync` to create a matching environment")
+    update_marker(
+        env_root,
+        venv_full_hash="",
+        venv_base_hash="",
+        build_hash="",
+        attach_mode="stale",
+    )
+
+
 def _uv_pip(venv: Path, args: list[str], env: dict | None = None) -> None:
     run(
         ["uv", "pip", "install", "--python", str(venv / "bin" / "python"), *args],
@@ -55,11 +81,35 @@ def _uv_pip(venv: Path, args: list[str], env: dict | None = None) -> None:
     )
 
 
-def _torch_backend_args(platform: str) -> list[str]:
-    return ["--torch-backend=auto"] if platform == "cuda" else []
-
-
 _CAP_FALLBACK = {"minor": "major", "major": "none"}
+_CUDA_LOCAL_VERSION_RE = re.compile(r"\+cu(\d+)")
+
+
+def _torch_backend_args(platform: str, requirement_files: list[Path]) -> list[str]:
+    if platform != "cuda":
+        return []
+    # uv's --torch-backend selects an index for torch packages, but auxiliary
+    # CUDA wheels such as torchcodec are not covered by that selection.  Pinned
+    # vLLM locks encode their CUDA variant in the local version (e.g.
+    # torchcodec==0.14.0+cu130); expose the matching PyTorch wheel index too.
+    cuda_variants = sorted(
+        {
+            match.group(1)
+            for requirement_file in requirement_files
+            for match in _CUDA_LOCAL_VERSION_RE.finditer(
+                requirement_file.read_text(errors="replace")
+            )
+        }
+    )
+    args = ["--torch-backend=auto"]
+    # PyTorch's wheel index also exposes a subset of ordinary PyPI packages.
+    # Prefer the versions from the lock across both trusted indexes; otherwise
+    # uv's first-index rule can select that partial mirror for e.g. requests.
+    if cuda_variants:
+        args += ["--index-strategy", "unsafe-best-match"]
+    for variant in cuda_variants:
+        args += ["--extra-index-url", f"https://download.pytorch.org/whl/cu{variant}"]
+    return args
 
 
 def _install_reqs(
@@ -83,7 +133,18 @@ def _install_reqs(
         else:
             cap_dest.unlink(missing_ok=True)
         try:
-            _uv_pip(venv, [*req_args, *cap_args, *_torch_backend_args(platform)])
+            _uv_pip(
+                venv,
+                [
+                    *req_args,
+                    *cap_args,
+                    *_torch_backend_args(
+                        platform,
+                        [*keys.layout.build_files, *keys.layout.runtime_files,
+                         *keys.layout.test_files],
+                    ),
+                ],
+            )
             return
         except subprocess.CalledProcessError:
             nxt = _CAP_FALLBACK.get(mode)

@@ -17,7 +17,7 @@ from .hooks import (
     init_env,
     install_hook,
 )
-from .layers import sync
+from .layers import invalidate_env, sync
 from .log import die, say, warn
 from .registry import (
     live_envs,
@@ -124,7 +124,13 @@ def cmd_activate(cfg: Config, args) -> int:
 
 def cmd_sync(cfg: Config, args) -> int:
     env_root = _env_root_from_cwd()
-    sync(cfg, env_root, fresh_venv=args.fresh_venv)
+    try:
+        sync(cfg, env_root, fresh_venv=args.fresh_venv)
+    except Exception as e:
+        warn(f"sync failed: {e}")
+        invalidate_env(env_root)
+        warn("env is STALE — fix the resolver error and run `ve sync`")
+        return 1
     return 0
 
 

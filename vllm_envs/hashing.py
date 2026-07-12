@@ -146,6 +146,11 @@ def cap_constraints(files: list[Path], mode: str) -> str:
     if mode == "none":
         return ""
     floors: dict[str, tuple[tuple[int, ...], str]] = {}
+    # A lock file commonly pins a package while an input requirement keeps its
+    # lower bound.  Do not generate a synthetic cap from the lower bound in
+    # that case: ``pyzmq>=25`` must not become ``pyzmq<26`` when the selected
+    # test lock explicitly requires ``pyzmq==27.1.0``.
+    explicitly_bounded: set[str] = set()
     for f in files:
         for raw in f.read_text(errors="replace").splitlines():
             line = raw.split("#", 1)[0].strip()
@@ -156,17 +161,20 @@ def cap_constraints(files: list[Path], mode: str) -> str:
             if not m:
                 continue
             name, rest = m.group(1), spec[len(m.group(1)):]
+            key = name.lower().replace("_", "-")
             if _CEILING_RE.search(rest):
+                explicitly_bounded.add(key)
                 continue
             fm = _FLOOR_RE.search(rest)
             if not fm:
                 continue
             floor = tuple(int(x) for x in fm.group(1).split("."))
-            key = name.lower().replace("_", "-")
             if key not in floors or floor > floors[key][0]:
                 floors[key] = (floor, name)
     lines = []
-    for _, (floor, name) in sorted(floors.items()):
+    for key, (floor, name) in sorted(floors.items()):
+        if key in explicitly_bounded:
+            continue
         parts = [*floor, 0, 0]
         bound = f"{parts[0] + 1}" if mode == "major" else f"{parts[0]}.{parts[1] + 1}"
         lines.append(f"{name}<{bound}\n")
