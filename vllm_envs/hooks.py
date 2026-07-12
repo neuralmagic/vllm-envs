@@ -1,4 +1,4 @@
-"""post-checkout hook: auto re-resolve layers on commit hops (incl. bisect)."""
+"""Git hooks that keep managed environments synchronized with their checkout."""
 
 import os
 import shutil
@@ -23,6 +23,15 @@ fi
 exec {ve} hook post-checkout "$1" "$2" "$3"
 """
 
+POST_REWRITE_HOOK_TEMPLATE = """#!/bin/sh
+{sentinel}
+hook_dir="$(dirname "$0")"
+if [ -x "$hook_dir/post-rewrite.pre-ve" ]; then
+    "$hook_dir/post-rewrite.pre-ve" "$@" || exit $?
+fi
+exec {ve} hook post-rewrite "$1"
+"""
+
 REQ_WATCH_PATHS = ("requirements",) + BUILD_LAYER_PATHS
 
 
@@ -34,12 +43,12 @@ def _hooks_dir(repo: Path) -> Path:
     return common_path / "hooks"
 
 
-def install_hook(repo: Path) -> None:
+def _install_hook(repo: Path, name: str, template: str) -> None:
     hooks = _hooks_dir(repo)
     hooks.mkdir(parents=True, exist_ok=True)
-    hook = hooks / "post-checkout"
+    hook = hooks / name
     ve_bin = shutil.which("ve") or sys.argv[0]
-    content = HOOK_TEMPLATE.format(sentinel=HOOK_SENTINEL, ve=ve_bin)
+    content = template.format(sentinel=HOOK_SENTINEL, ve=ve_bin)
     if hook.exists():
         existing = hook.read_text()
         if HOOK_SENTINEL in existing:
@@ -47,10 +56,15 @@ def install_hook(repo: Path) -> None:
                 hook.write_text(content)
             return
         # chain-load pre-existing hook
-        say("preserving existing post-checkout hook as post-checkout.pre-ve")
-        hook.rename(hooks / "post-checkout.pre-ve")
+        say(f"preserving existing {name} hook as {name}.pre-ve")
+        hook.rename(hooks / f"{name}.pre-ve")
     hook.write_text(content)
     hook.chmod(0o755)
+
+
+def install_hook(repo: Path) -> None:
+    _install_hook(repo, "post-checkout", HOOK_TEMPLATE)
+    _install_hook(repo, "post-rewrite", POST_REWRITE_HOOK_TEMPLATE)
     _exclude_marker(repo)
 
 
@@ -143,6 +157,23 @@ def handle_post_checkout(cfg: Config, old: str, new: str, flag: str) -> int:
         return 0
     n = len(changed.splitlines())
     say(f"{n} build/deps-relevant file(s) changed across checkout → syncing env")
+    try:
+        sync(cfg, root)
+    except Exception as e:
+        warn(f"sync failed: {e}")
+        warn("env may be INCONSISTENT — fix and run `ve sync`")
+        return 1
+    return 0
+
+
+def handle_post_rewrite(cfg: Config, command: str) -> int:
+    """Refresh a managed environment after amend or rebase rewrites commits."""
+    root = Path(
+        run(["git", "rev-parse", "--show-toplevel"], cwd=Path.cwd()).stdout.strip()
+    )
+    if not (root / MARKER_NAME).exists():
+        return 0
+    say(f"git {command or 'rewrite'} completed → syncing env")
     try:
         sync(cfg, root)
     except Exception as e:
