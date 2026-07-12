@@ -128,21 +128,15 @@ def _main_ref(repo: Path) -> str:
 def _sync_state(wt: Path, head: str, main_ref: str) -> str:
     if head in ("", "(bare)"):
         return "unknown"
-    on_remote = run(["git", "branch", "-r", "--contains", "HEAD"],
-                    cwd=wt, check=False).stdout.strip()
-    if on_remote:
+    # commits reachable from HEAD but from no remote-tracking ref == truly unpushed
+    unpushed = run(["git", "rev-list", "--count", "HEAD", "--not", "--remotes"],
+                   cwd=wt, check=False).stdout.strip()
+    if unpushed == "0":
         return "pushed"
-    merged = run(["git", "merge-base", "--is-ancestor", "HEAD", main_ref],
-                 cwd=wt, check=False)
-    if merged.returncode == 0:
+    if run(["git", "merge-base", "--is-ancestor", "HEAD", main_ref],
+           cwd=wt, check=False).returncode == 0:
         return "merged"
-    upstream = run(["git", "rev-parse", "--abbrev-ref", "--symbolic-full-name",
-                    "@{u}"], cwd=wt, check=False)
-    if upstream.returncode == 0:
-        ahead = run(["git", "rev-list", "--count", "@{u}..HEAD"],
-                    cwd=wt, check=False).stdout.strip()
-        return f"ahead:{ahead}" if ahead and ahead != "0" else "pushed"
-    return "local"
+    return f"ahead:{unpushed}" if unpushed.isdigit() else "local"
 
 
 def _classify(path: Path, primary: Path, t3: dict) -> tuple[str, dict]:
