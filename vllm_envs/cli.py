@@ -9,7 +9,7 @@ from pathlib import Path
 from .config import MARKER_NAME, STORE_NAMES, Config, load_config
 from .extprojects import user_overrides
 from .fiemap import reflink_usage
-from .gc import collect_candidates, run_gc, total_size
+from .gc import collect_candidates, run_gc
 from .hashing import build_key, build_paths_dirty, detect_platform, venv_keys
 from .hooks import (
     handle_post_checkout,
@@ -337,9 +337,11 @@ def cmd_du(cfg: Config, args) -> int:
     envs = live_envs(cfg)
     say("measuring disk usage (reflink extent scan — may take a minute)...")
     groups: dict[str, list[Path]] = {s: [cfg.store(s)] for s in STORE_NAMES}
+    scopes = {s: "stores" for s in STORE_NAMES}
     for name, path in envs.items():
         groups[f"env:{name}"] = [path / ".venv"]
-    usage = reflink_usage(groups)
+        scopes[f"env:{name}"] = "envs"
+    usage = reflink_usage(groups, scopes)
 
     if usage.supported:
         logical = dict(usage.apparent)
@@ -361,7 +363,16 @@ def cmd_du(cfg: Config, args) -> int:
 
     head = f"  {'':18s} {'entries':>7s} {'logical':>10s}"
     if usage.supported:
-        head += f" {'excl':>10s}"
+        head += f" {'phys·excl':>10s}"
+
+    def subtotal(logical_sum: int, keys: list[str], scope: str, extra: str) -> None:
+        line = f"  {'subtotal':18s} {'':>7s} {human_size(logical_sum):>10s}"
+        if usage.supported:
+            excl = sum(usage.exclusive.get(k, 0) for k in keys)
+            phys = usage.unique_by_scope.get(scope, 0)
+            line += (f" {human_size(excl):>10s}"
+                     f"   ({human_size(phys)} physical{extra})")
+        print(line)
 
     print("stores")
     print(head)
@@ -371,14 +382,17 @@ def cmd_du(cfg: Config, args) -> int:
         n = sum(1 for c in candidates if c.store == store)
         store_total += logical.get(store, 0)
         print(row(store, str(n), store))
-    print(f"  {'subtotal':18s} {'':>7s} {human_size(store_total):>10s}"
-          f"   (logical; gc cap {cfg.max_size_gb:.0f}GB enforced on physical)")
+    subtotal(store_total, list(STORE_NAMES), "stores",
+             f"; gc cap {cfg.max_size_gb:.0f}GB")
 
     if envs:
         print("\nlive envs")
         print(head)
+        env_total = 0
         for name in sorted(envs):
+            env_total += logical.get(f"env:{name}", 0)
             print(row(name, "", f"env:{name}"))
+        subtotal(env_total, [f"env:{n}" for n in envs], "envs", "")
 
     if usage.supported:
         excl_sum = sum(usage.exclusive.values())
@@ -405,7 +419,7 @@ def cmd_du(cfg: Config, args) -> int:
         pass
     print("note: logical = apparent size (du; reflink-shared blocks counted per "
           "file); physical = real on-disk blocks, each extent counted once; "
-          "excl = freed if that item alone is deleted")
+          "phys·excl = physical freed if that item alone is deleted")
 
     if args.entries:
         for store in STORE_NAMES:

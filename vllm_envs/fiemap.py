@@ -83,20 +83,32 @@ class ReflinkUsage:
     unique_total: int = 0  # union of all extents across every group (true footprint)
     apparent: dict[str, int] = field(default_factory=dict)  # sum of extents, ~ du
     exclusive: dict[str, int] = field(default_factory=dict)  # reclaimed if group deleted
+    unique_by_scope: dict[str, int] = field(default_factory=dict)  # phys per scope
 
 
-def reflink_usage(groups: dict[str, Iterable[Path]]) -> ReflinkUsage:
+def reflink_usage(
+    groups: dict[str, Iterable[Path]],
+    scopes: dict[str, str] | None = None,
+) -> ReflinkUsage:
     """Physical-extent accounting for named groups of directory roots.
 
     A physical extent is "exclusive" to a group when every file referencing it
     lives in that group; deleting the group frees those bytes. Extents shared
     across groups belong to none exclusively.
+
+    `scopes` maps group name -> scope label; `unique_by_scope` then reports the
+    reflink-aware physical size of each scope (e.g. all stores vs all envs).
     """
     # key: (st_dev, physical_offset) -> owning group index, or _SHARED
     owner: dict[tuple[int, int], int] = {}
     length: dict[tuple[int, int], int] = {}
     apparent = {name: 0 for name in groups}
     supported = False
+
+    scope_bit = {sc: 1 << i for i, sc in enumerate(sorted(set(scopes.values())))} \
+        if scopes else {}
+    group_bit = {n: scope_bit[scopes[n]] for n in groups} if scopes else {}
+    mask: dict[tuple[int, int], int] = {}
 
     for gid, (name, roots) in enumerate(groups.items()):
         seen_inodes: set[tuple[int, int]] = set()  # dedupe hardlinks (like du)
@@ -124,6 +136,8 @@ def reflink_usage(groups: dict[str, Iterable[Path]]) -> ReflinkUsage:
                             length[key] = ext_len
                             if new_inode:  # apparent == du: reflinks counted per file
                                 apparent[name] += ext_len
+                            if scopes:
+                                mask[key] = mask.get(key, 0) | group_bit[name]
                             prev = owner.get(key)
                             if prev is None:
                                 owner[key] = gid
@@ -136,18 +150,29 @@ def reflink_usage(groups: dict[str, Iterable[Path]]) -> ReflinkUsage:
         return ReflinkUsage(supported=False)
 
     per_dev: dict[int, list[tuple[int, int]]] = {}
+    per_scope: dict[str, dict[int, list[tuple[int, int]]]] = {
+        sc: {} for sc in scope_bit
+    }
     exclusive = {name: 0 for name in groups}
     names = list(groups)
     for (dev, phys), ext_len in length.items():
-        per_dev.setdefault(dev, []).append((phys, phys + ext_len))
+        iv = (phys, phys + ext_len)
+        per_dev.setdefault(dev, []).append(iv)
+        m = mask.get((dev, phys), 0)
+        for sc, bit in scope_bit.items():
+            if m & bit:
+                per_scope[sc].setdefault(dev, []).append(iv)
         gid = owner[(dev, phys)]
         if gid != _SHARED:
             exclusive[names[gid]] += ext_len
 
-    unique_total = sum(_merge_len(intervals) for intervals in per_dev.values())
+    def merge(devs: dict[int, list[tuple[int, int]]]) -> int:
+        return sum(_merge_len(ivs) for ivs in devs.values())
+
     return ReflinkUsage(
         supported=True,
-        unique_total=unique_total,
+        unique_total=merge(per_dev),
         apparent=apparent,
         exclusive=exclusive,
+        unique_by_scope={sc: merge(devs) for sc, devs in per_scope.items()},
     )
