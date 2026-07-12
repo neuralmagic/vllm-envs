@@ -522,7 +522,7 @@ def main(argv: list[str] | None = None) -> int:
     sp.add_argument("--dry-run", action="store_true", help="show what would be reaped")
     sp.set_defaults(func=cmd_reap)
 
-    sp = sub.add_parser("gc", help="prune caches (LRU, 50GB default cap)")
+    sp = sub.add_parser("gc", help="prune caches (LRU, 100GB default cap)")
     sp.add_argument("--dry-run", action="store_true")
     sp.add_argument("--free", type=float, metavar="GB",
                     help="evict until this many GB are reclaimed")

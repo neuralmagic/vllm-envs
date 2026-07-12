@@ -12,35 +12,63 @@ Requires: `uv`, `ccache`, git ≥ 2.15. Reflink-capable filesystem (XFS/btrfs) r
 
 ## Usage
 
-Worktree-native workflow — manage your clone in place, and every new worktree becomes an env automatically:
+**Manage a clone in place** — build + deps assembled from cache into `./.venv`:
 
 ```bash
-git clone https://github.com/vllm-project/vllm && cd vllm
-ve init                     # manage this checkout in place: venv + extensions from cache
-source .venv/bin/activate   # plain venv activation — always works
-git worktree add ../my-feature my-branch   # auto-runs ve init in the new worktree
+cd vllm                     # your vLLM clone
+ve init
+source .venv/bin/activate   # plain venv — always works
+```
+
+**New worktrees become envs automatically.** After `ve init` (or `ve new`) has run once in a repo, its worktree hook auto-initializes every new worktree:
+
+```bash
+git worktree add ../my-feature my-branch   # auto-runs ve init
 cd ../my-feature && source .venv/bin/activate
 ```
 
-Optionally add `eval "$(ve shellenv)"` to your shell rc (bash/zsh); then `ve activate` sources the env's venv into your current shell from anywhere inside it, and `deactivate` works as usual.
-
-Or spawn disposable envs by ref:
+**Or spawn disposable envs by ref** (created under `~/vllm-envs/`):
 
 ```bash
-cd /path/to/vllm            # your vLLM clone
 ve new main                 # env from main
 ve new v0.13.0 --name bisect1
-cd ~/vllm-envs/bisect1
-source .venv/bin/activate   # or `ve activate` with shellenv installed
-git checkout <sha>          # post-checkout hook auto-syncs layers
-git bisect start ...        # works transparently
-ve status                   # layer hashes + cache state
-ve rm bisect1               # for `ve init` envs: unmanages, never deletes your checkout
-ve gc --dry-run             # LRU cache pruning (50GB default cap)
-ve du [--entries]           # usage audit: per store, uv cache/ccache, hardlink sharing, live envs
 ```
 
-Auto-init on `git worktree add` fires only for worktrees of a repo where the hook is installed (`ve init` or `ve new` installs it); set `VE_NO_AUTO_INIT=1` to skip it for one command.
+Inside an env you can `git checkout <sha>` / `git bisect` freely — a hook re-syncs the layers on each hop. Optionally add `eval "$(ve shellenv)"` to your shell rc, then `ve activate` sources the venv from anywhere inside an env.
+
+**Everyday commands:**
+
+| Command | What it does |
+|---|---|
+| `ve status` | layer hashes + cache state for the current env |
+| `ve sync` | re-resolve layers for the current worktree HEAD |
+| `ve list` | list live envs |
+| `ve rm <name>` | remove an env (`ve init` envs are unmanaged, never deleted) |
+| `ve reap` | list worktrees; reap stale ones (see below) |
+| `ve gc [--dry-run]` | LRU cache pruning (100GB default cap, on physical usage) |
+| `ve du` | disk audit: logical vs reflink-aware physical, per store/env |
+
+## Using with t3code
+
+t3code creates a git worktree per session under `~/.t3/worktrees/<repo>/`. Because auto-init fires on `git worktree add`, each session gets a ready `.venv` from cache automatically — just install the hook once in your clone:
+
+```bash
+cd ~/local/vllm && ve init   # once; installs the worktree hook
+```
+
+Archiving a t3code session leaves its worktree on disk. `ve reap` finds and prunes them:
+
+```bash
+ve reap             # list every worktree: state (active/archived/deleted/orphan),
+                    #   last activity, dirty count, push status, and reap safety
+ve reap --stale     # remove all archived/deleted/orphan worktrees...
+                    #   ...but only the clean AND pushed/merged ones
+ve reap <name>      # reap one by name or path
+```
+
+Reaping is gated: a worktree with uncommitted changes or un-pushed commits is skipped (add `--force` to override, `--dry-run` to preview). Active, primary, and non-t3 worktrees are never touched without `--force`.
+
+Set `VE_NO_AUTO_INIT=1` to skip auto-init for a single `git worktree add`.
 
 ## How it works
 
@@ -91,7 +119,7 @@ Warm-cache timing: fresh `ve new`/`ve init` ~7s, no-op `ve sync` ~1s; a cold bui
 
 ```toml
 [cache]
-max_size_gb = 50       # VE_MAX_SIZE_GB overrides; enforced on physical usage (blocks apportioned by hardlink count)
+max_size_gb = 100      # VE_MAX_SIZE_GB overrides; enforced on reflink-aware physical usage
 min_age_hours = 72
 
 [core]
