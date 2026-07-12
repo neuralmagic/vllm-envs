@@ -268,7 +268,8 @@ def cmd_status(cfg: Config, args) -> int:
     root = _env_root_from_cwd()
     m = read_marker(root)
     platform = cfg.platform or detect_platform()
-    keys = venv_keys(root, platform, cfg.python, cap=cfg.cap)
+    keys = venv_keys(root, platform, cfg.python,
+                     with_test=cfg.with_test, cap=cfg.cap)
     bhash = build_key(root, platform, cfg.python)
     head = git(["rev-parse", "--short", "HEAD"], cwd=root)
     overrides = user_overrides()
@@ -282,6 +283,11 @@ def cmd_status(cfg: Config, args) -> int:
 
     print(f"venv base:  {keys.base_hash}  {state(m.get('venv_base_hash'), keys.base_hash)}")
     print(f"venv full:  {keys.full_hash}  {state(m.get('venv_full_hash'), keys.full_hash)}")
+    if cfg.with_test and keys.layout.test_files:
+        rel = keys.layout.test_files[0].relative_to(root)
+        print(f"test deps:  included ({rel})")
+    else:
+        print(f"test deps:  excluded ({'no test reqs found' if cfg.with_test else 'disabled'})")
     build_state = state(m.get("build_hash") or None, bhash)
     if m.get("attach_mode") == "local-build":
         build_state = "private (dirty/override build)"

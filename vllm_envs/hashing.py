@@ -10,7 +10,7 @@ import json
 import os
 import re
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
 from shutil import which
@@ -85,6 +85,7 @@ class ReqLayout:
     build_files: list[Path]  # heavy layer (torch + build deps)
     runtime_files: list[Path]  # top-up layer
     recognized: bool
+    test_files: list[Path] = field(default_factory=list)  # optional test deps
 
 
 def requirements_layout(root: Path, platform: str, with_test: bool = False) -> ReqLayout:
@@ -111,15 +112,18 @@ def requirements_layout(root: Path, platform: str, with_test: bool = False) -> R
             root / "requirements-lint.txt",
         )
         build = build or existing(root / "requirements-build.txt")
+    test_files: list[Path] = []
     if with_test:
-        runtime += existing(
+        # prefer the pinned lock; fall back to unpinned .in (non-x86_64 / no lock)
+        test_files = existing(
+            req / "test" / f"{platform}.txt",
             req / "test" / f"{platform}.in",
             req / "test.in",
             root / "requirements-test.txt",
-        )
+        )[:1]
 
     if build and runtime:
-        return ReqLayout(build, runtime, recognized=True)
+        return ReqLayout(build, runtime, recognized=True, test_files=test_files)
 
     # Unrecognized layout: hash everything requirements-ish (coarse but correct).
     all_reqs = sorted(
@@ -207,6 +211,7 @@ def venv_keys(
     full_parts = [
         base_hash,
         *(f"{p.relative_to(root)}:{_hash_file(p)}" for p in layout.runtime_files),
+        *(f"{p.relative_to(root)}:{_hash_file(p)}" for p in layout.test_files),
     ]
     return VenvKeys(base_hash, _sha(full_parts), layout)
 

@@ -77,7 +77,7 @@ An env is just a git worktree plus a private `.venv`, assembled from shared cont
 | Store | Contents | Keyed by |
 |---|---|---|
 | `venvs-base/` | torch + build deps | build requirements + torch pins + python/CUDA version |
-| `venvs/` | full deps (derived from `venvs-base`) | base key + runtime requirements |
+| `venvs/` | full deps (derived from `venvs-base`); test deps too when `[venv] test` is on | base key + runtime (+ test) requirements |
 | `ext-src/` | pinned external sources (cutlass, flash-attn, ...) | project + pin parsed from the worktree's cmake files |
 | `builds/` | compiled-extension wheel + extracted-file mirror + editable-install replay | content hash of csrc/ cmake/ CMakeLists.txt setup.py (+ python/CUDA) |
 | `cmake-build/` | persistent cmake trees for incremental local builds | same hash as `builds/` |
@@ -128,7 +128,13 @@ python = "3.12"
 
 [venv]
 cap = "minor"   # cap unpinned requirement floors: minor | major | none (VE_CAP overrides)
+test = true     # install & cache requirements/test/<platform>.txt into the full venv
+                #   (prefers the pinned .txt, falls back to .in); VE_WITH_TEST overrides
 ```
+
+With `test = true` (the default) the `venvs/` layer also installs vLLM's test
+dependencies (`pytest`, `lm-eval`, ...), cached and reflink-shared like the rest;
+set `test = false` (or `VE_WITH_TEST=0`) to keep envs lean.
 
 Env vars: `VE_CACHE_DIR`, `VE_NO_SYNC=1` (skip hook sync, warn instead).
 

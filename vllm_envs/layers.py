@@ -73,7 +73,8 @@ def _install_reqs(
     mode = cfg.cap
     while True:
         content = cap_constraints(
-            [*keys.layout.build_files, *keys.layout.runtime_files], mode
+            [*keys.layout.build_files, *keys.layout.runtime_files,
+             *keys.layout.test_files], mode
         )
         cap_args = []
         if content:
@@ -159,7 +160,7 @@ def ensure_full_template(cfg: Config, keys: VenvKeys, platform: str) -> Path:
         _rewrite_venv_paths(base, entry)
         (entry / ".complete").unlink(missing_ok=True)
         req_args: list[str] = []
-        for f in keys.layout.runtime_files:
+        for f in [*keys.layout.runtime_files, *keys.layout.test_files]:
             req_args += ["-r", str(f)]
         if req_args:
             _install_reqs(cfg, keys, entry, req_args, platform,
@@ -174,7 +175,8 @@ def ensure_full_template(cfg: Config, keys: VenvKeys, platform: str) -> Path:
 def resolve_venv(cfg: Config, env_root: Path, fresh: bool = False) -> tuple[Path, VenvKeys]:
     """Ensure env_root/.venv matches the worktree's requirements."""
     platform = cfg.platform or detect_platform()
-    keys = venv_keys(env_root, platform, cfg.python, cap=cfg.cap)
+    keys = venv_keys(env_root, platform, cfg.python,
+                     with_test=cfg.with_test, cap=cfg.cap)
     venv = env_root / ".venv"
     marker = read_marker(env_root)
     current = marker.get("venv_full_hash")
@@ -191,7 +193,7 @@ def resolve_venv(cfg: Config, env_root: Path, fresh: bool = False) -> tuple[Path
                 f"({current} → {keys.full_hash})")
             template = ensure_full_template(cfg, keys, platform)
             req_args: list[str] = []
-            for f in keys.layout.runtime_files:
+            for f in [*keys.layout.runtime_files, *keys.layout.test_files]:
                 req_args += ["-r", str(f)]
             if req_args:
                 _install_reqs(cfg, keys, venv, req_args, platform,

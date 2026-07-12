@@ -36,6 +36,7 @@ class Config:
     python: str = "3.12"
     platform: str = ""  # auto-detect when empty
     cap: str = "minor"  # cap unpinned requirement floors: minor | major | none
+    with_test: bool = True  # install & cache requirements/test/<platform>.txt
     raw: dict = field(default_factory=dict)
 
     @property
@@ -63,13 +64,17 @@ def load_config() -> Config:
         cfg.envs_root = Path(core.get("envs_root", cfg.envs_root)).expanduser()
         cfg.python = str(core.get("python", cfg.python))
         cfg.platform = str(core.get("platform", cfg.platform))
-        cfg.cap = str(data.get("venv", {}).get("cap", cfg.cap))
+        venv = data.get("venv", {})
+        cfg.cap = str(venv.get("cap", cfg.cap))
+        cfg.with_test = bool(venv.get("test", cfg.with_test))
     if v := os.environ.get("VE_MAX_SIZE_GB"):
         cfg.max_size_gb = float(v)
     if v := os.environ.get("VE_ENVS_ROOT"):
         cfg.envs_root = Path(v)
     if v := os.environ.get("VE_CAP"):
         cfg.cap = v
+    if v := os.environ.get("VE_WITH_TEST"):
+        cfg.with_test = v.strip().lower() not in ("0", "false", "no", "off")
     if cfg.cap not in ("minor", "major", "none"):
         raise SystemExit(f"[ve] invalid cap mode {cfg.cap!r} (minor|major|none)")
     return cfg
