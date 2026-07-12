@@ -22,6 +22,7 @@ class DeepEPResolution:
     key: str
     ref: str
     nvshmem_version: str
+    cuda_arch_list: str
     installer: Path
 
 
@@ -44,6 +45,15 @@ def _docker_deepep_ref(root: Path) -> str | None:
     return str(value)
 
 
+def _docker_cuda_arch_list(root: Path) -> str:
+    try:
+        dockerfile = (root / "docker" / "Dockerfile").read_text()
+    except OSError:
+        return ""
+    match = re.search(r"export TORCH_CUDA_ARCH_LIST=['\"]([^'\"]+)", dockerfile)
+    return match.group(1) if match else ""
+
+
 def resolve(root: Path, venv_hash: str) -> DeepEPResolution:
     installer = root / "tools" / "ep_kernels" / "install_python_libraries.sh"
     if not installer.is_file():
@@ -51,7 +61,7 @@ def resolve(root: Path, venv_hash: str) -> DeepEPResolution:
     script = installer.read_text()
     ref = _docker_deepep_ref(root) or _shell_default(script, "DEEPEP_COMMIT_HASH")
     nvshmem = _shell_default(script, "NVSHMEM_VER")
-    archs = os.environ.get("TORCH_CUDA_ARCH_LIST", "")
+    archs = os.environ.get("TORCH_CUDA_ARCH_LIST") or _docker_cuda_arch_list(root)
     payload = json.dumps(
         {
             "installer": hashlib.sha256(installer.read_bytes()).hexdigest(),
@@ -64,7 +74,7 @@ def resolve(root: Path, venv_hash: str) -> DeepEPResolution:
         sort_keys=True,
     )
     key = hashlib.sha256(payload.encode()).hexdigest()[:12]
-    return DeepEPResolution(key, ref, nvshmem, installer)
+    return DeepEPResolution(key, ref, nvshmem, archs, installer)
 
 
 def _wheel(entry: Path) -> Path | None:
@@ -87,6 +97,9 @@ def _ensure_wheel(cfg: Config, venv: Path, resolution: DeepEPResolution) -> Path
             shutil.rmtree(entry)
         workspace = entry / "workspace"
         workspace.mkdir(parents=True)
+        build_env = {"VIRTUAL_ENV": str(venv)}
+        if resolution.cuda_arch_list:
+            build_env["TORCH_CUDA_ARCH_LIST"] = resolution.cuda_arch_list
         run(
             [
                 "bash",
@@ -100,7 +113,7 @@ def _ensure_wheel(cfg: Config, venv: Path, resolution: DeepEPResolution) -> Path
                 "--nvshmem-ver",
                 resolution.nvshmem_version,
             ],
-            env={"VIRTUAL_ENV": str(venv)},
+            env=build_env,
             stream_prefix="[ve]   [DeepEP] ",
         )
         wheel = _wheel(entry)
@@ -114,6 +127,7 @@ def _ensure_wheel(cfg: Config, venv: Path, resolution: DeepEPResolution) -> Path
                 "hash": resolution.key,
                 "deepep_ref": resolution.ref,
                 "nvshmem_version": resolution.nvshmem_version,
+                "cuda_arch_list": resolution.cuda_arch_list,
                 "wheel": wheel.name,
             },
         )

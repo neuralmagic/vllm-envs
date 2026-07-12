@@ -36,6 +36,24 @@ class DeepEPResolutionTest(unittest.TestCase):
         self.assertEqual(resolution.ref, "docker-ref")
         self.assertEqual(resolution.nvshmem_version, "3.3.24")
 
+    def test_uses_docker_deepep_architectures(self):
+        root = self.make_root()
+        dockerfile = root / "docker" / "Dockerfile"
+        dockerfile.parent.mkdir()
+        dockerfile.write_text("export TORCH_CUDA_ARCH_LIST='9.0a 10.0a'\n")
+
+        resolution = resolve(root, "venv-hash")
+
+        self.assertEqual(resolution.cuda_arch_list, "9.0a 10.0a")
+
+    def test_explicit_architecture_override_wins(self):
+        root = self.make_root()
+
+        with patch.dict("os.environ", {"TORCH_CUDA_ARCH_LIST": "10.0"}):
+            resolution = resolve(root, "venv-hash")
+
+        self.assertEqual(resolution.cuda_arch_list, "10.0")
+
     def test_falls_back_to_installer_pin(self):
         root = self.make_root()
 
