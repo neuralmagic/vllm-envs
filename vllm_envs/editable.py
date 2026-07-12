@@ -14,6 +14,7 @@ failure falls back to the full uv attach.
 """
 
 import base64
+import configparser
 import hashlib
 import json
 import os
@@ -22,10 +23,11 @@ import subprocess
 import zipfile
 from pathlib import Path
 
-from .log import say, warn
+from .log import say
 from .util import run
 
 META_NAME = "editable.json"
+SCHEMA_VERSION = 2
 
 
 def site_packages(venv: Path) -> Path | None:
@@ -47,7 +49,23 @@ def _artifacts(sp: Path) -> tuple[Path, Path, Path] | None:
 
 def editable_present(venv: Path) -> bool:
     sp = site_packages(venv)
-    return sp is not None and _artifacts(sp) is not None
+    arts = _artifacts(sp) if sp else None
+    if arts is None:
+        return False
+    return all((venv / "bin" / name).is_file() for name in _console_scripts(arts[2]))
+
+
+def _console_scripts(dist: Path) -> list[str]:
+    entry_points = dist / "entry_points.txt"
+    if not entry_points.is_file():
+        return []
+    parser = configparser.ConfigParser()
+    parser.read(entry_points)
+    return (
+        sorted(parser["console_scripts"])
+        if parser.has_section("console_scripts")
+        else []
+    )
 
 
 def _head(env_root: Path) -> str:
@@ -65,8 +83,14 @@ def _store_file(src: Path, dst: Path) -> None:
 def capture(env_root: Path, venv: Path, wheel: Path, store_entry: Path) -> None:
     """Record the editable install at builds/<hash>/editable/ (idempotent)."""
     ed = store_entry / "editable"
-    if (ed / META_NAME).exists():
+    try:
+        existing = json.loads((ed / META_NAME).read_text())
+    except (OSError, json.JSONDecodeError):
+        existing = {}
+    if existing.get("schema") == SCHEMA_VERSION:
         return
+    if ed.exists():
+        shutil.rmtree(ed)
     sp = site_packages(venv)
     arts = _artifacts(sp) if sp else None
     if arts is None:
@@ -75,7 +99,8 @@ def capture(env_root: Path, venv: Path, wheel: Path, store_entry: Path) -> None:
     with zipfile.ZipFile(wheel) as zf:
         members = [n for n in zf.namelist() if not n.endswith("/")]
     extracted = [
-        m for m in members
+        m
+        for m in members
         if m.startswith("vllm/") and m not in tracked and (env_root / m).is_file()
     ]
     mirror = store_entry / "extracted"
@@ -91,11 +116,27 @@ def capture(env_root: Path, venv: Path, wheel: Path, store_entry: Path) -> None:
             shutil.copytree(a, site_dir / a.name)
         else:
             shutil.copy2(a, site_dir / a.name)
-    (ed / META_NAME).write_text(json.dumps({
-        "head": _head(env_root),
-        "worktree": str(env_root),
-        "extracted": extracted,
-    }, indent=2))
+    scripts = _console_scripts(arts[2])
+    scripts_dir = ed / "scripts"
+    scripts_dir.mkdir()
+    for name in scripts:
+        script = venv / "bin" / name
+        if not script.is_file():
+            shutil.rmtree(ed)
+            return
+        shutil.copy2(script, scripts_dir / name)
+    (ed / META_NAME).write_text(
+        json.dumps(
+            {
+                "schema": SCHEMA_VERSION,
+                "head": _head(env_root),
+                "worktree": str(env_root),
+                "extracted": extracted,
+                "scripts": scripts,
+            },
+            indent=2,
+        )
+    )
     say(f"attach: captured editable install → builds/{store_entry.name}/editable")
 
 
@@ -134,7 +175,7 @@ def replay(env_root: Path, venv: Path, store_entry: Path) -> bool:
         meta = json.loads((ed / META_NAME).read_text())
     except (OSError, json.JSONDecodeError):
         return False
-    if meta.get("head") != _head(env_root):
+    if meta.get("schema") != SCHEMA_VERSION or meta.get("head") != _head(env_root):
         return False  # version string embeds the commit; do not fake it
     sp = site_packages(venv)
     if sp is None:
@@ -178,9 +219,22 @@ def replay(env_root: Path, venv: Path, store_entry: Path) -> bool:
                 continue
             if old_s in text:
                 p.write_text(text.replace(old_s, new_s))
+    for name in meta.get("scripts", []):
+        src = ed / "scripts" / name
+        if not src.is_file():
+            return False
+        dst = venv / "bin" / name
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dst)
+        text = dst.read_text()
+        if old_s != new_s and old_s in text:
+            dst.write_text(text.replace(old_s, new_s))
+        dst.chmod(0o755)
     dists = sorted(sp.glob("vllm-*.dist-info"))
     if len(dists) == 1 and (dists[0] / "RECORD").is_file():
         _fix_record(sp, dists[0])
-    say(f"attach: replayed editable install from builds/{store_entry.name} "
-        f"({len(extracted)} extracted files, no setup.py)")
+    say(
+        f"attach: replayed editable install from builds/{store_entry.name} "
+        f"({len(extracted)} extracted files, no setup.py)"
+    )
     return True
