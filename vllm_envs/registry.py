@@ -87,3 +87,12 @@ def referenced_build_hashes(cfg: Config) -> set[str]:
         if h := m.get("build_hash"):
             hashes.add(h)
     return hashes
+
+
+def referenced_deepep_hashes(cfg: Config) -> set[str]:
+    """DeepEP layers whose NVSHMEM runtime is used by a live environment."""
+    hashes = set()
+    for path in live_envs(cfg).values():
+        if h := read_marker(path).get("deepep_hash"):
+            hashes.add(h)
+    return hashes

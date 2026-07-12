@@ -78,6 +78,7 @@ An env is just a git worktree plus a private `.venv`, assembled from shared cont
 |---|---|---|
 | `venvs-base/` | torch + build deps | build requirements + torch pins + python/CUDA version |
 | `venvs/` | full deps (derived from `venvs-base`); test deps too when `[venv] test` is on | base key + runtime (+ test) requirements |
+| `ep-kernels/` | DeepEP wheel and its NVSHMEM runtime | vLLM installer + Docker pin + venv/CUDA inputs |
 | `ext-src/` | pinned external sources (cutlass, flash-attn, ...) | project + pin parsed from the worktree's cmake files |
 | `builds/` | compiled-extension wheel + extracted-file mirror + editable-install replay | content hash of csrc/ cmake/ CMakeLists.txt setup.py (+ python/CUDA) |
 | `cmake-build/` | persistent cmake trees for incremental local builds | same hash as `builds/` |
@@ -130,11 +131,19 @@ python = "3.12"
 cap = "minor"   # cap unpinned requirement floors: minor | major | none (VE_CAP overrides)
 test = true     # install & cache requirements/test/<platform>.txt into the full venv
                 #   (prefers the pinned .txt, falls back to .in); VE_WITH_TEST overrides
+deepep = true   # install DeepEP in every CUDA env; VE_WITH_DEEPEP overrides
 ```
 
 With `test = true` (the default) the `venvs/` layer also installs vLLM's test
 dependencies (`pytest`, `lm-eval`, ...), cached and reflink-shared like the rest;
 set `test = false` (or `VE_WITH_TEST=0`) to keep envs lean.
+
+CUDA environments install DeepEP by default using vLLM's
+`tools/ep_kernels/install_python_libraries.sh`. The DeepEP commit follows
+`docker/versions.json`, falling back to the installer's own default, and the
+NVSHMEM version follows the installer default. Set `deepep = false` (or
+`VE_WITH_DEEPEP=0`) to opt out. Commits from before that installer was added
+are detected and skipped.
 
 Env vars: `VE_CACHE_DIR`, `VE_NO_SYNC=1` (skip hook sync, warn instead).
 

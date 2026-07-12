@@ -11,6 +11,7 @@ from pathlib import Path
 
 from . import editable
 from .config import SCRATCH_DIR_NAME, Config
+from .deepep import sync_deepep
 from .extprojects import src_dir_env, user_overrides
 from .hashing import (
     VenvKeys,
@@ -530,7 +531,10 @@ def sync(cfg: Config, env_root: Path, fresh_venv: bool = False) -> None:
         warn("VE_NO_SYNC=1 — env is STALE; run `ve sync` when ready")
         return
     head = run(["git", "rev-parse", "--short", "HEAD"], cwd=env_root).stdout.strip()
-    venv, _keys = resolve_venv(cfg, env_root, fresh=fresh_venv)
+    venv, keys = resolve_venv(cfg, env_root, fresh=fresh_venv)
     res = resolve_build(cfg, env_root, venv)
     attach(cfg, env_root, venv, res)
+    platform = cfg.platform or detect_platform()
+    if cfg.with_deepep and platform == "cuda":
+        sync_deepep(cfg, env_root, venv, keys.full_hash)
     say(f"env consistent at {head}")

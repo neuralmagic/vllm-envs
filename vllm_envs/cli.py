@@ -297,6 +297,10 @@ def cmd_status(cfg: Config, args) -> int:
     if m.get("attach_mode") == "local-build":
         build_state = "private (dirty/override build)"
     print(f"build:      {bhash}  {build_state}")
+    if cfg.with_deepep and platform == "cuda":
+        print(f"DeepEP:     {m.get('deepep_hash') or 'not installed'}")
+    else:
+        print("DeepEP:     disabled")
     if not keys.layout.recognized:
         print("note:       unrecognized requirements layout — coarse hashing in effect")
     if dirty:

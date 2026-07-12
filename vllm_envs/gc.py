@@ -9,8 +9,8 @@ from .config import EVICTION_ORDER, Config
 from .fiemap import reflink_usage
 from .locks import release, try_entry_lock
 from .log import say, warn
-from .registry import referenced_build_hashes
-from .store import META_NAME, entry_size, is_pinned, last_used
+from .registry import referenced_build_hashes, referenced_deepep_hashes
+from .store import entry_size, is_pinned, last_used
 from .util import human_size, run
 
 
@@ -27,6 +27,7 @@ def collect_candidates(cfg: Config) -> list[Candidate]:
     now = time.time()
     min_age_s = cfg.min_age_hours * 3600
     refs = referenced_build_hashes(cfg)
+    deepep_refs = referenced_deepep_hashes(cfg)
     out: list[Candidate] = []
     for store in EVICTION_ORDER:
         base = cfg.store(store)
@@ -40,6 +41,8 @@ def collect_candidates(cfg: Config) -> list[Candidate]:
             if is_pinned(entry):
                 protected = "pinned"
             elif store == "builds" and entry.name in refs:
+                protected = "referenced by live env"
+            elif store == "ep-kernels" and entry.name in deepep_refs:
                 protected = "referenced by live env"
             elif now - lu < min_age_s:
                 protected = f"used <{cfg.min_age_hours:.0f}h ago"

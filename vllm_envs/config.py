@@ -6,9 +6,13 @@ from pathlib import Path
 DEFAULT_CACHE_DIR = Path.home() / ".cache" / "vllm-envs"
 DEFAULT_ENVS_ROOT = Path.home() / "vllm-envs"
 
-STORE_NAMES = ("cmake-build", "ext-src", "venvs", "venvs-base", "builds")
+STORE_NAMES = (
+    "cmake-build", "ext-src", "ep-kernels", "venvs", "venvs-base", "builds"
+)
 # Cross-store eviction priority (first evicted first).
-EVICTION_ORDER = ("cmake-build", "ext-src", "venvs", "venvs-base", "builds")
+EVICTION_ORDER = (
+    "cmake-build", "ext-src", "venvs", "venvs-base", "ep-kernels", "builds"
+)
 
 MARKER_NAME = ".vllm-env.toml"
 SCRATCH_DIR_NAME = ".ve"
@@ -37,6 +41,7 @@ class Config:
     platform: str = ""  # auto-detect when empty
     cap: str = "minor"  # cap unpinned requirement floors: minor | major | none
     with_test: bool = True  # install & cache requirements/test/<platform>.txt
+    with_deepep: bool = True  # install DeepEP in every CUDA environment
     raw: dict = field(default_factory=dict)
 
     @property
@@ -67,6 +72,7 @@ def load_config() -> Config:
         venv = data.get("venv", {})
         cfg.cap = str(venv.get("cap", cfg.cap))
         cfg.with_test = bool(venv.get("test", cfg.with_test))
+        cfg.with_deepep = bool(venv.get("deepep", cfg.with_deepep))
     if v := os.environ.get("VE_MAX_SIZE_GB"):
         cfg.max_size_gb = float(v)
     if v := os.environ.get("VE_ENVS_ROOT"):
@@ -75,6 +81,8 @@ def load_config() -> Config:
         cfg.cap = v
     if v := os.environ.get("VE_WITH_TEST"):
         cfg.with_test = v.strip().lower() not in ("0", "false", "no", "off")
+    if v := os.environ.get("VE_WITH_DEEPEP"):
+        cfg.with_deepep = v.strip().lower() not in ("0", "false", "no", "off")
     if cfg.cap not in ("minor", "major", "none"):
         raise SystemExit(f"[ve] invalid cap mode {cfg.cap!r} (minor|major|none)")
     return cfg
