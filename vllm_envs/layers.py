@@ -47,32 +47,6 @@ def _rewrite_venv_paths(old: Path, new: Path) -> None:
             f.chmod(mode)
 
 
-def invalidate_env(env_root: Path) -> None:
-    """Remove an incompatible private venv after a failed synchronization.
-
-    A branch switch can cross an extension ABI boundary even when Git's
-    post-checkout hook cannot complete dependency resolution.  A ve-managed
-    venv is a disposable clone of cached layers, so retaining it would make the
-    new source run against stale compiled ops.  Clearing both the clone and its
-    marker makes that state fail closed; the next successful ``ve sync`` creates
-    a matching clone from the shared cache.
-    """
-    venv = env_root / ".venv"
-    if venv.is_symlink():
-        venv.unlink()
-        warn("removed stale .venv; run `ve sync` to create a matching environment")
-    elif venv.exists():
-        shutil.rmtree(venv)
-        warn("removed stale .venv; run `ve sync` to create a matching environment")
-    update_marker(
-        env_root,
-        venv_full_hash="",
-        venv_base_hash="",
-        build_hash="",
-        attach_mode="stale",
-    )
-
-
 def _uv_pip(venv: Path, args: list[str], env: dict | None = None) -> None:
     run(
         ["uv", "pip", "install", "--python", str(venv / "bin" / "python"), *args],

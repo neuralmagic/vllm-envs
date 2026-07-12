@@ -17,7 +17,7 @@ from .hooks import (
     init_env,
     install_hook,
 )
-from .layers import invalidate_env, sync
+from .layers import sync
 from .log import die, say, warn
 from .registry import (
     live_envs,
@@ -128,8 +128,7 @@ def cmd_sync(cfg: Config, args) -> int:
         sync(cfg, env_root, fresh_venv=args.fresh_venv)
     except Exception as e:
         warn(f"sync failed: {e}")
-        invalidate_env(env_root)
-        warn("env is STALE — fix the resolver error and run `ve sync`")
+        warn("previous .venv retained; its hashes may be STALE for this checkout")
         return 1
     return 0
 

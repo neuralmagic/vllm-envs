@@ -7,7 +7,7 @@ import time
 from pathlib import Path
 
 from .config import BUILD_LAYER_PATHS, MARKER_NAME, Config
-from .layers import invalidate_env, sync
+from .layers import sync
 from .log import say, warn
 from .registry import live_envs, register_env, write_marker
 from .util import run
@@ -161,8 +161,7 @@ def handle_post_checkout(cfg: Config, old: str, new: str, flag: str) -> int:
         sync(cfg, root)
     except Exception as e:
         warn(f"sync failed: {e}")
-        invalidate_env(root)
-        warn("env is STALE — fix the resolver error and run `ve sync`")
+        warn("previous .venv retained; its hashes may be STALE for this checkout")
         return 1
     return 0
 
@@ -179,7 +178,6 @@ def handle_post_rewrite(cfg: Config, command: str) -> int:
         sync(cfg, root)
     except Exception as e:
         warn(f"sync failed: {e}")
-        invalidate_env(root)
-        warn("env is STALE — fix the resolver error and run `ve sync`")
+        warn("previous .venv retained; its hashes may be STALE for this checkout")
         return 1
     return 0
