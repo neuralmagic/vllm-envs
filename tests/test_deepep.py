@@ -2,6 +2,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 from unittest.mock import patch
 
@@ -16,6 +17,14 @@ NVSHMEM_VER=${NVSHMEM_VER:-"3.3.24"}
 
 
 class DeepEPResolutionTest(unittest.TestCase):
+    def setUp(self):
+        self.run_mock = self.enterContext(
+            patch(
+                "vllm_envs.deepep.run",
+                return_value=SimpleNamespace(stdout=""),
+            )
+        )
+
     def make_root(self) -> Path:
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         installer = root / "tools" / "ep_kernels" / "install_python_libraries.sh"
@@ -53,6 +62,17 @@ class DeepEPResolutionTest(unittest.TestCase):
             resolution = resolve(root, "venv-hash")
 
         self.assertEqual(resolution.cuda_arch_list, "10.0")
+
+    def test_adds_local_cuda_architecture_to_docker_targets(self):
+        root = self.make_root()
+        dockerfile = root / "docker" / "Dockerfile"
+        dockerfile.parent.mkdir()
+        dockerfile.write_text("export TORCH_CUDA_ARCH_LIST='9.0a 10.0a'\n")
+        self.run_mock.return_value = SimpleNamespace(stdout="10.3\n10.3\n")
+
+        resolution = resolve(root, "venv-hash")
+
+        self.assertEqual(resolution.cuda_arch_list, "9.0a 10.0a 10.3a")
 
     def test_falls_back_to_installer_pin(self):
         root = self.make_root()

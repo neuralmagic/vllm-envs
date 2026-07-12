@@ -143,8 +143,9 @@ CUDA environments install DeepEP by default using vLLM's
 `docker/versions.json`, falling back to the installer's own default, and the
 NVSHMEM version follows the installer default. Set `deepep = false` (or
 `VE_WITH_DEEPEP=0`) to opt out. Commits from before that installer was added
-are detected and skipped. CUDA architectures follow the DeepEP Docker build,
-unless `TORCH_CUDA_ARCH_LIST` is explicitly set.
+are detected and skipped. CUDA architectures include the DeepEP Docker targets
+and locally detected GPU targets, unless `TORCH_CUDA_ARCH_LIST` is explicitly
+set.
 
 Env vars: `VE_CACHE_DIR`, `VE_NO_SYNC=1` (skip hook sync, warn instead).
 

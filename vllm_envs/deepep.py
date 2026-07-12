@@ -54,6 +54,23 @@ def _docker_cuda_arch_list(root: Path) -> str:
     return match.group(1) if match else ""
 
 
+def _cuda_arch_list(root: Path) -> str:
+    if override := os.environ.get("TORCH_CUDA_ARCH_LIST"):
+        return override
+    archs = _docker_cuda_arch_list(root).split()
+    proc = run(
+        ["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader"],
+        check=False,
+    )
+    for capability in proc.stdout.splitlines():
+        capability = capability.strip()
+        if capability and int(capability.split(".", 1)[0]) >= 9:
+            local_arch = f"{capability}a"
+            if local_arch not in archs:
+                archs.append(local_arch)
+    return " ".join(archs)
+
+
 def resolve(root: Path, venv_hash: str) -> DeepEPResolution:
     installer = root / "tools" / "ep_kernels" / "install_python_libraries.sh"
     if not installer.is_file():
@@ -61,7 +78,7 @@ def resolve(root: Path, venv_hash: str) -> DeepEPResolution:
     script = installer.read_text()
     ref = _docker_deepep_ref(root) or _shell_default(script, "DEEPEP_COMMIT_HASH")
     nvshmem = _shell_default(script, "NVSHMEM_VER")
-    archs = os.environ.get("TORCH_CUDA_ARCH_LIST") or _docker_cuda_arch_list(root)
+    archs = _cuda_arch_list(root)
     payload = json.dumps(
         {
             "installer": hashlib.sha256(installer.read_bytes()).hexdigest(),
