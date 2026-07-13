@@ -48,7 +48,15 @@ class ExactGitRefIntegrationTest(unittest.TestCase):
         self.git(origin, "tag", "archived")
         self.git(origin, "reset", "--hard", main)
 
-        with patch.dict(os.environ, {"GIT_ALLOW_PROTOCOL": "file"}):
+        with patch.dict(
+            os.environ,
+            {
+                "GIT_ALLOW_PROTOCOL": "file",
+                "GIT_DIR": str(origin / ".git"),
+                "GIT_WORK_TREE": str(origin),
+                "GIT_PREFIX": "leaked/from/hook/",
+            },
+        ):
             fetch_ref(str(origin), "archived", checkout, "test")
 
         self.assertEqual((checkout / "data").read_text(), "archived\n")

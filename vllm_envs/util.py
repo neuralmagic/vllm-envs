@@ -10,7 +10,7 @@ from .log import say
 def run(
     cmd: list[str],
     cwd: Path | str | None = None,
-    env: dict | None = None,
+    env: dict[str, str | None] | None = None,
     capture: bool = True,
     check: bool = True,
     stream_prefix: str | None = None,
@@ -18,7 +18,11 @@ def run(
     """Run a command. stream_prefix streams output to stderr line by line."""
     full_env = dict(os.environ)
     if env:
-        full_env.update(env)
+        for name, value in env.items():
+            if value is None:
+                full_env.pop(name, None)
+            else:
+                full_env[name] = value
     if stream_prefix is not None:
         proc = subprocess.Popen(
             cmd,

@@ -31,6 +31,29 @@ FIELD_RE = re.compile(
     r'(GIT_REPOSITORY|GIT_TAG|SOURCE_SUBDIR)\s+"?([^"\n]+?)"?\s*$', re.M
 )
 
+# Git exports these to hooks so nested Git commands operate on the checkout
+# that triggered the hook. External-source repositories must not inherit them.
+FOREIGN_GIT_ENV = {
+    name: None
+    for name in (
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_COMMON_DIR",
+        "GIT_CONFIG",
+        "GIT_CONFIG_COUNT",
+        "GIT_CONFIG_PARAMETERS",
+        "GIT_DIR",
+        "GIT_GRAFT_FILE",
+        "GIT_IMPLICIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_NO_REPLACE_OBJECTS",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_PREFIX",
+        "GIT_REPLACE_REF_BASE",
+        "GIT_SHALLOW_FILE",
+        "GIT_WORK_TREE",
+    )
+}
+
 
 @dataclass
 class ExtPin:
@@ -122,11 +145,16 @@ def fetch_ref(repo: str, ref: str, dest: Path, label: str) -> None:
     if dest.exists():
         run(["rm", "-rf", str(dest)])
     dest.mkdir(parents=True)
-    run(["git", "init", "--quiet"], cwd=dest)
-    run(["git", "remote", "add", "origin", repo], cwd=dest)
+    run(["git", "init", "--quiet"], cwd=dest, env=FOREIGN_GIT_ENV)
+    run(
+        ["git", "remote", "add", "origin", repo],
+        cwd=dest,
+        env=FOREIGN_GIT_ENV,
+    )
     fetch = run(
         ["git", "fetch", "--depth=1", "origin", ref],
         cwd=dest,
+        env=FOREIGN_GIT_ENV,
         check=False,
     )
     if fetch.returncode != 0:
@@ -136,16 +164,24 @@ def fetch_ref(repo: str, ref: str, dest: Path, label: str) -> None:
         run(
             ["git", "fetch", "--depth=1", "origin", expanded],
             cwd=dest,
+            env=FOREIGN_GIT_ENV,
             stream_prefix=f"[ve]   [{label}] ",
         )
-    run(["git", "checkout", "--quiet", "--detach", "FETCH_HEAD"], cwd=dest)
+    run(
+        ["git", "checkout", "--quiet", "--detach", "FETCH_HEAD"],
+        cwd=dest,
+        env=FOREIGN_GIT_ENV,
+    )
     _ensure_submodules(dest, label)
 
 
 def _ensure_submodules(dest: Path, label: str) -> None:
     if (dest / ".gitmodules").is_file():
         status = run(
-            ["git", "submodule", "status", "--recursive"], cwd=dest, check=False
+            ["git", "submodule", "status", "--recursive"],
+            cwd=dest,
+            env=FOREIGN_GIT_ENV,
+            check=False,
         )
         if status.returncode != 0 or any(
             line.startswith(("-", "+")) for line in status.stdout.splitlines()
@@ -156,6 +192,7 @@ def _ensure_submodules(dest: Path, label: str) -> None:
                     "--depth=1",
                 ],
                 cwd=dest,
+                env=FOREIGN_GIT_ENV,
                 stream_prefix=f"[ve]   [{label}] ",
             )
 
