@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .config import Config
+from .extprojects import fetch_ref
 from .hashing import cuda_version
 from .locks import entry_lock
 from .log import say
@@ -94,19 +95,51 @@ def resolve(root: Path, venv_hash: str) -> DeepEPResolution:
     return DeepEPResolution(key, ref, nvshmem, archs, installer)
 
 
-def _wheel(entry: Path) -> Path | None:
-    wheels = sorted((entry / "workspace" / "dist").glob("*.whl"))
-    return wheels[-1] if wheels else None
+def _wheels(entry: Path) -> list[Path]:
+    return sorted((entry / "workspace" / "dist").glob("*.whl"))
 
 
-def _ensure_wheel(cfg: Config, venv: Path, resolution: DeepEPResolution) -> Path:
+def _prepare_sources(resolution: DeepEPResolution, workspace: Path) -> None:
+    """Pre-fetch exact refs that historical installer scripts clone loosely."""
+    script = resolution.installer.read_text()
+    try:
+        pplx_ref = _shell_default(script, "PPLX_COMMIT_HASH")
+    except RuntimeError:
+        pplx_ref = ""
+    if pplx_ref:
+        pplx_dir = workspace / "pplx-kernels"
+        fetch_ref(
+            "https://github.com/ppl-ai/pplx-kernels",
+            pplx_ref,
+            pplx_dir,
+            "pplx-kernels",
+        )
+        # Historical pplx-kernels passed this as a malformed CMake warning
+        # option. CMake 4 rejects it; the intended cache variable needs -D.
+        setup = pplx_dir / "setup.py"
+        if setup.is_file():
+            text = setup.read_text()
+            fixed = text.replace('"-WITH_TESTS=OFF"', '"-DWITH_TESTS=OFF"')
+            if fixed != text:
+                setup.write_text(fixed)
+    fetch_ref(
+        "https://github.com/deepseek-ai/DeepEP",
+        resolution.ref,
+        workspace / "DeepEP",
+        "DeepEP",
+    )
+
+
+def _ensure_wheels(
+    cfg: Config, venv: Path, resolution: DeepEPResolution
+) -> list[Path]:
     entry = cfg.store("ep-kernels") / resolution.key
     with entry_lock(entry):
-        wheel = _wheel(entry)
-        if wheel is not None and (entry / ".complete").exists():
+        wheels = _wheels(entry)
+        if wheels and (entry / ".complete").exists():
             say(f"DeepEP layer: cache HIT ({resolution.key})")
             touch_last_used(entry)
-            return wheel
+            return wheels
         say(
             f"DeepEP layer: cache MISS ({resolution.key}) — building with vLLM installer"
         )
@@ -114,6 +147,7 @@ def _ensure_wheel(cfg: Config, venv: Path, resolution: DeepEPResolution) -> Path
             shutil.rmtree(entry)
         workspace = entry / "workspace"
         workspace.mkdir(parents=True)
+        _prepare_sources(resolution, workspace)
         build_env = {"VIRTUAL_ENV": str(venv)}
         if resolution.cuda_arch_list:
             build_env["TORCH_CUDA_ARCH_LIST"] = resolution.cuda_arch_list
@@ -133,9 +167,9 @@ def _ensure_wheel(cfg: Config, venv: Path, resolution: DeepEPResolution) -> Path
             env=build_env,
             stream_prefix="[ve]   [DeepEP] ",
         )
-        wheel = _wheel(entry)
-        if wheel is None:
-            raise RuntimeError("vLLM EP installer produced no DeepEP wheel")
+        wheels = _wheels(entry)
+        if not any(w.name.lower().startswith("deep_ep-") for w in wheels):
+            raise RuntimeError("vLLM EP installer produced no deep_ep wheel")
         (entry / ".complete").touch()
         write_meta(
             entry,
@@ -145,11 +179,11 @@ def _ensure_wheel(cfg: Config, venv: Path, resolution: DeepEPResolution) -> Path
                 "deepep_ref": resolution.ref,
                 "nvshmem_version": resolution.nvshmem_version,
                 "cuda_arch_list": resolution.cuda_arch_list,
-                "wheel": wheel.name,
+                "wheels": [wheel.name for wheel in wheels],
             },
         )
         touch_last_used(entry)
-        return wheel
+        return wheels
 
 
 def sync_deepep(cfg: Config, root: Path, venv: Path, venv_hash: str) -> None:
@@ -161,9 +195,17 @@ def sync_deepep(cfg: Config, root: Path, venv: Path, venv_hash: str) -> None:
     resolution = resolve(root, venv_hash)
     marker = read_marker(root)
     entry = cfg.store("ep-kernels") / resolution.key
+    cached_wheels = _wheels(entry)
+    imports = ["deep_ep"]
+    if any(w.name.lower().startswith("pplx_kernels-") for w in cached_wheels):
+        imports.append("pplx_kernels")
     installed = (
         run(
-            [str(venv / "bin" / "python"), "-c", "import deep_ep"],
+            [
+                str(venv / "bin" / "python"),
+                "-c",
+                f"import {', '.join(imports)}",
+            ],
             check=False,
         ).returncode
         == 0
@@ -171,12 +213,13 @@ def sync_deepep(cfg: Config, root: Path, venv: Path, venv_hash: str) -> None:
     if (
         marker.get("deepep_hash") == resolution.key
         and (entry / ".complete").exists()
+        and cached_wheels
         and installed
     ):
         say(f"DeepEP layer: up to date ({resolution.key})")
         touch_last_used(entry)
         return
-    wheel = _ensure_wheel(cfg, venv, resolution)
+    wheels = _ensure_wheels(cfg, venv, resolution)
     run(
         [
             "uv",
@@ -185,7 +228,7 @@ def sync_deepep(cfg: Config, root: Path, venv: Path, venv_hash: str) -> None:
             "--python",
             str(venv / "bin" / "python"),
             "--reinstall",
-            str(wheel),
+            *(str(wheel) for wheel in wheels),
         ],
         stream_prefix="[ve]   [uv] ",
     )

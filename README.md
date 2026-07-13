@@ -149,6 +149,31 @@ set.
 
 Env vars: `VE_CACHE_DIR`, `VE_NO_SYNC=1` (skip hook sync, warn instead).
 
+## Tests
+
+The default suite is fast and replaces only external builds and installs:
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+An opt-in E2E mode runs real `uv` installs, vLLM/CUDA compilation, DeepEP
+build and import, Git hooks, worktree creation, a committed build-input edit,
+and checkout back to the original cached build:
+
+```bash
+VE_REAL_E2E=1 \
+VE_REAL_E2E_REPO=~/local/vllm \
+VE_REAL_E2E_CACHE_DIR=~/.cache/vllm-envs-e2e \
+python -m unittest -v tests.test_real_e2e
+```
+
+`VE_REAL_E2E_CACHE_DIR` is optional. Without it the test uses and removes an
+isolated cold cache; setting it keeps the expensive layers for subsequent
+cache-hit runs. Select another commit with `VE_REAL_E2E_REF`; set
+`VE_REAL_E2E_WITH_TEST=0` to omit vLLM's test requirements. Real E2E requires
+an NVIDIA host and is skipped unless explicitly enabled.
+
 ## Caveats (v1)
 
 - Requirements top-up on commit hop converges the env venv (installs the delta, uninstalls deps dropped from the template resolution); user-added packages survive, but for a guaranteed-clean venv use `ve sync --fresh-venv`.

@@ -107,26 +107,38 @@ def _install_reqs(
             cap_args = ["-c", str(cap_dest)]
         else:
             cap_dest.unlink(missing_ok=True)
-        try:
-            _uv_pip(
-                venv,
+        install_args = [
+            *req_args,
+            *cap_args,
+            *_torch_backend_args(
+                platform,
+                [*keys.layout.build_files, *keys.layout.runtime_files,
+                 *keys.layout.test_files],
+            ),
+        ]
+        if cap_args:
+            probe = run(
                 [
-                    *req_args,
-                    *cap_args,
-                    *_torch_backend_args(
-                        platform,
-                        [*keys.layout.build_files, *keys.layout.runtime_files,
-                         *keys.layout.test_files],
-                    ),
+                    "uv", "pip", "install", "--python", str(venv / "bin" / "python"),
+                    "--dry-run", *install_args,
                 ],
+                check=False,
             )
+            if probe.returncode != 0:
+                nxt = _CAP_FALLBACK.get(mode)
+                if nxt is None:
+                    raise subprocess.CalledProcessError(probe.returncode, probe.args)
+                say(f"venv layer: cap={mode} incompatible → trying cap={nxt}")
+                mode = nxt
+                continue
+        try:
+            _uv_pip(venv, install_args)
             return
         except subprocess.CalledProcessError:
             nxt = _CAP_FALLBACK.get(mode)
             if not cap_args or nxt is None:
                 raise
-            warn(f"venv layer: cap={mode} constraints unsatisfiable → "
-                 f"retrying with cap={nxt}")
+            say(f"venv layer: cap={mode} incompatible → trying cap={nxt}")
             mode = nxt
 
 
@@ -367,6 +379,18 @@ def resolve_build(cfg: Config, env_root: Path, venv: Path) -> BuildResolution:
     bhash = build_key(env_root, platform, cfg.python)
     overrides = user_overrides()
     dirty = build_paths_dirty(env_root)
+    marker = read_marker(env_root)
+
+    if (
+        not overrides
+        and not dirty
+        and marker.get("build_hash") == bhash
+        and marker.get("attach_mode") == "precompiled-fetch"
+        and editable.editable_present(venv)
+        and any((env_root / "vllm").glob("*.so"))
+    ):
+        say(f"build layer: env-local precompiled fallback up to date ({bhash})")
+        return BuildResolution("precompiled-fetch", None, bhash, shared=False)
 
     if overrides:
         say(f"build-layer caching disabled: local overrides active "
@@ -475,8 +499,18 @@ def _dedupe_extracted_sos(env_root: Path, wheel: Path, store_entry: Path) -> Non
 
 def attach(cfg: Config, env_root: Path, venv: Path, res: BuildResolution) -> None:
     store_entry = cfg.store("builds") / res.build_hash
+    marker = read_marker(env_root)
+    if (
+        res.mode == "precompiled-fetch"
+        and res.wheel is None
+        and marker.get("build_hash") == res.build_hash
+        and marker.get("attach_mode") == res.mode
+        and editable.editable_present(venv)
+        and any((env_root / "vllm").glob("*.so"))
+    ):
+        say(f"attach: env-local precompiled fallback up to date ({res.build_hash})")
+        return
     if res.shared:
-        marker = read_marker(env_root)
         if (marker.get("build_hash") == res.build_hash
                 and marker.get("attach_mode") == res.mode
                 and editable.editable_present(venv)
@@ -516,7 +550,11 @@ def attach(cfg: Config, env_root: Path, venv: Path, res: BuildResolution) -> Non
             warn(f"attach capture skipped ({e})")
     update_marker(
         env_root,
-        build_hash=res.build_hash if res.shared else "",
+        build_hash=(
+            res.build_hash
+            if res.shared or res.mode == "precompiled-fetch"
+            else ""
+        ),
         attach_mode=res.mode,
     )
 

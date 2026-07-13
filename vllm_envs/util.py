@@ -29,8 +29,13 @@ def run(
             text=True,
         )
         assert proc.stdout is not None
-        for line in proc.stdout:
-            print(f"{stream_prefix}{line.rstrip()}", file=sys.stderr, flush=True)
+        try:
+            for line in proc.stdout:
+                print(
+                    f"{stream_prefix}{line.rstrip()}", file=sys.stderr, flush=True
+                )
+        finally:
+            proc.stdout.close()
         proc.wait()
         if check and proc.returncode != 0:
             raise subprocess.CalledProcessError(proc.returncode, cmd)

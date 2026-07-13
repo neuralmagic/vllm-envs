@@ -84,6 +84,7 @@ class ReflinkUsage:
     apparent: dict[str, int] = field(default_factory=dict)  # sum of extents, ~ du
     exclusive: dict[str, int] = field(default_factory=dict)  # reclaimed if group deleted
     unique_by_scope: dict[str, int] = field(default_factory=dict)  # phys per scope
+    exclusive_by_scope: dict[str, int] = field(default_factory=dict)  # scope-only phys
 
 
 def reflink_usage(
@@ -96,8 +97,9 @@ def reflink_usage(
     lives in that group; deleting the group frees those bytes. Extents shared
     across groups belong to none exclusively.
 
-    `scopes` maps group name -> scope label; `unique_by_scope` then reports the
-    reflink-aware physical size of each scope (e.g. all stores vs all envs).
+    `scopes` maps group name -> scope label. `unique_by_scope` reports all
+    physical bytes referenced by a scope, while `exclusive_by_scope` reports
+    bytes referenced by that scope and no other scope.
     """
     # key: (st_dev, physical_offset) -> owning group index, or _SHARED
     owner: dict[tuple[int, int], int] = {}
@@ -153,6 +155,9 @@ def reflink_usage(
     per_scope: dict[str, dict[int, list[tuple[int, int]]]] = {
         sc: {} for sc in scope_bit
     }
+    exclusive_scope: dict[str, dict[int, list[tuple[int, int]]]] = {
+        sc: {} for sc in scope_bit
+    }
     exclusive = {name: 0 for name in groups}
     names = list(groups)
     for (dev, phys), ext_len in length.items():
@@ -162,6 +167,8 @@ def reflink_usage(
         for sc, bit in scope_bit.items():
             if m & bit:
                 per_scope[sc].setdefault(dev, []).append(iv)
+            if m == bit:
+                exclusive_scope[sc].setdefault(dev, []).append(iv)
         gid = owner[(dev, phys)]
         if gid != _SHARED:
             exclusive[names[gid]] += ext_len
@@ -175,4 +182,7 @@ def reflink_usage(
         apparent=apparent,
         exclusive=exclusive,
         unique_by_scope={sc: merge(devs) for sc, devs in per_scope.items()},
+        exclusive_by_scope={
+            sc: merge(devs) for sc, devs in exclusive_scope.items()
+        },
     )

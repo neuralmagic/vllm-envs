@@ -1,4 +1,5 @@
 import json
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -7,7 +8,9 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from vllm_envs.config import Config
-from vllm_envs.deepep import resolve, sync_deepep
+from vllm_envs.deepep import DeepEPResolution, _prepare_sources, resolve, sync_deepep
+from vllm_envs.registry import read_marker, write_marker
+from vllm_envs.store import read_meta
 
 
 INSTALLER = """\
@@ -96,6 +99,104 @@ class DeepEPResolutionTest(unittest.TestCase):
             sync_deepep(Config(), root, root / ".venv", "venv-hash")
 
         resolve_mock.assert_not_called()
+
+
+class DeepEPLayerIntegrationTest(unittest.TestCase):
+    def test_historical_short_refs_are_prefetched_before_running_installer(self):
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        installer = root / "install.sh"
+        installer.write_text(
+            'PPLX_COMMIT_HASH=${PPLX_COMMIT_HASH:-"12cecfd"}\n'
+        )
+        resolution = DeepEPResolution(
+            "key", "73b6ea4", "3.3.24", "10.3a", installer
+        )
+
+        def fake_fetch(repo, ref, dest, label):
+            dest.mkdir(parents=True)
+            if label == "pplx-kernels":
+                (dest / "setup.py").write_text(
+                    'cmake_args = ["-WITH_TESTS=OFF"]\n'
+                )
+
+        with patch("vllm_envs.deepep.fetch_ref", side_effect=fake_fetch) as fetch:
+            _prepare_sources(resolution, root / "workspace")
+
+        self.assertEqual(fetch.call_count, 2)
+        self.assertEqual(fetch.call_args_list[0].args[1], "12cecfd")
+        self.assertEqual(fetch.call_args_list[1].args[1], "73b6ea4")
+        setup = root / "workspace" / "pplx-kernels" / "setup.py"
+        self.assertIn('"-DWITH_TESTS=OFF"', setup.read_text())
+
+    def test_sync_reuses_complete_layer_and_rebuilds_when_installer_changes(self):
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        checkout = root / "checkout"
+        venv = checkout / ".venv"
+        installer = checkout / "tools" / "ep_kernels" / "install_python_libraries.sh"
+        installer.parent.mkdir(parents=True)
+        installer.write_text(INSTALLER)
+        (venv / "bin").mkdir(parents=True)
+        write_marker(checkout, {"name": "test"})
+        cfg = Config(cache_dir=root / "cache")
+
+        state = {
+            "installed": False,
+            "builds": 0,
+            "installs": 0,
+            "install_command": [],
+        }
+
+        def fake_run(cmd, **kwargs):
+            if cmd[0] == "nvidia-smi":
+                return subprocess.CompletedProcess(cmd, 0, "", "")
+            if cmd[0] == "bash":
+                workspace = Path(cmd[cmd.index("--workspace") + 1])
+                dist = workspace / "dist"
+                dist.mkdir(parents=True)
+                (dist / f"deep_ep-{state['builds']}.whl").touch()
+                (dist / f"pplx_kernels-{state['builds']}.whl").touch()
+                state["builds"] += 1
+                return subprocess.CompletedProcess(cmd, 0, "", "")
+            if cmd[:2] == [str(venv / "bin" / "python"), "-c"]:
+                return subprocess.CompletedProcess(
+                    cmd, 0 if state["installed"] else 1, "", ""
+                )
+            if cmd[:3] == ["uv", "pip", "install"]:
+                state["installed"] = True
+                state["installs"] += 1
+                state["install_command"] = cmd
+                return subprocess.CompletedProcess(cmd, 0, "", "")
+            self.fail(f"unexpected command: {cmd}")
+
+        with (
+            patch("vllm_envs.deepep.run", side_effect=fake_run),
+            patch("vllm_envs.deepep.cuda_version", return_value="12.9"),
+            patch("vllm_envs.deepep._prepare_sources"),
+        ):
+            sync_deepep(cfg, checkout, venv, "venv-hash")
+            first_hash = read_marker(checkout)["deepep_hash"]
+            first_entry = cfg.store("ep-kernels") / first_hash
+
+            self.assertTrue((first_entry / ".complete").exists())
+            self.assertEqual(read_meta(first_entry)["deepep_ref"], "script-ref")
+            self.assertEqual((state["builds"], state["installs"]), (1, 1))
+            self.assertTrue(
+                any("deep_ep-0.whl" in arg for arg in state["install_command"])
+            )
+            self.assertTrue(
+                any("pplx_kernels-0.whl" in arg for arg in state["install_command"])
+            )
+
+            sync_deepep(cfg, checkout, venv, "venv-hash")
+            self.assertEqual((state["builds"], state["installs"]), (1, 1))
+
+            installer.write_text(INSTALLER + "# changed installer behavior\n")
+            sync_deepep(cfg, checkout, venv, "venv-hash")
+
+        second_hash = read_marker(checkout)["deepep_hash"]
+        self.assertNotEqual(first_hash, second_hash)
+        self.assertTrue((cfg.store("ep-kernels") / second_hash / ".complete").exists())
+        self.assertEqual((state["builds"], state["installs"]), (2, 2))
 
 
 if __name__ == "__main__":

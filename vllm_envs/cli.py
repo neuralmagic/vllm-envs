@@ -8,10 +8,12 @@ from pathlib import Path
 
 from .config import MARKER_NAME, STORE_NAMES, Config, load_config
 from .extprojects import user_overrides
+from .deepep import resolve as resolve_deepep
 from .fiemap import reflink_usage
 from .gc import collect_candidates, run_gc
 from .hashing import build_key, build_paths_dirty, detect_platform, venv_keys
 from .hooks import (
+    handle_post_commit,
     handle_post_checkout,
     handle_post_rewrite,
     init_env,
@@ -296,9 +298,18 @@ def cmd_status(cfg: Config, args) -> int:
     build_state = state(m.get("build_hash") or None, bhash)
     if m.get("attach_mode") == "local-build":
         build_state = "private (dirty/override build)"
+    elif m.get("attach_mode") == "precompiled-fetch" and m.get("build_hash") == bhash:
+        build_state = "OK (env-local precompiled fallback)"
     print(f"build:      {bhash}  {build_state}")
     if cfg.with_deepep and platform == "cuda":
-        print(f"DeepEP:     {m.get('deepep_hash') or 'not installed'}")
+        try:
+            wanted_deepep = resolve_deepep(root, keys.full_hash).key
+            print(
+                f"DeepEP:     {wanted_deepep}  "
+                f"{state(m.get('deepep_hash'), wanted_deepep)}"
+            )
+        except RuntimeError:
+            print("DeepEP:     unsupported by this commit")
     else:
         print("DeepEP:     disabled")
     if not keys.layout.recognized:
@@ -355,7 +366,7 @@ def cmd_du(cfg: Config, args) -> int:
     scopes = {s: "stores" for s in STORE_NAMES}
     for name, path in envs.items():
         groups[f"env:{name}"] = [path / ".venv"]
-        scopes[f"env:{name}"] = "envs"
+        scopes[f"env:{name}"] = "venvs"
     usage = reflink_usage(groups, scopes)
 
     if usage.supported:
@@ -378,15 +389,13 @@ def cmd_du(cfg: Config, args) -> int:
 
     head = f"  {'':18s} {'entries':>7s} {'logical':>10s}"
     if usage.supported:
-        head += f" {'phys·excl':>10s}"
+        head += f" {'delete frees':>10s}"
 
-    def subtotal(logical_sum: int, keys: list[str], scope: str, extra: str) -> None:
+    def subtotal(logical_sum: int, scope: str) -> None:
         line = f"  {'subtotal':18s} {'':>7s} {human_size(logical_sum):>10s}"
         if usage.supported:
-            excl = sum(usage.exclusive.get(k, 0) for k in keys)
-            phys = usage.unique_by_scope.get(scope, 0)
-            line += (f" {human_size(excl):>10s}"
-                     f"   ({human_size(phys)} physical{extra})")
+            freed = usage.exclusive_by_scope.get(scope, 0)
+            line += f" {human_size(freed):>10s}"
         print(line)
 
     print("stores")
@@ -396,25 +405,33 @@ def cmd_du(cfg: Config, args) -> int:
     for store in stores:
         n = sum(1 for c in candidates if c.store == store)
         store_total += logical.get(store, 0)
-        print(row(store, str(n), store))
-    subtotal(store_total, list(STORE_NAMES), "stores",
-             f"; gc cap {cfg.max_size_gb:.0f}GB")
+        note = (
+            "  (package data shared with uv cache)"
+            if store == "venvs-base"
+            else ""
+        )
+        print(row(store, str(n), store) + note)
+    subtotal(store_total, "stores")
 
     if envs:
-        print("\nlive envs")
+        print("\nvenvs")
         print(head)
         env_total = 0
         for name in sorted(envs):
             env_total += logical.get(f"env:{name}", 0)
             print(row(name, "", f"env:{name}"))
-        subtotal(env_total, [f"env:{n}" for n in envs], "envs", "")
+        subtotal(env_total, "venvs")
 
     if usage.supported:
-        excl_sum = sum(usage.exclusive.values())
-        shared = max(usage.unique_total - excl_sum, 0)
-        print(f"\nphysical (stores + envs, unique) {human_size(usage.unique_total):>10s}")
-        print(f"  exclusive to one item          {human_size(excl_sum):>10s}")
-        print(f"  shared across items            {human_size(shared):>10s}")
+        # Assign store↔venv reflinks to stores so these two figures are
+        # non-overlapping and add exactly to the true on-disk total.
+        stores_phys = usage.unique_by_scope.get("stores", 0)
+        venvs_phys = usage.exclusive_by_scope.get("venvs", 0)
+        print("\nphysical (non-overlapping)")
+        print(f"  stores                         {human_size(stores_phys):>10s}")
+        print(f"  venvs                          {human_size(venvs_phys):>10s}")
+        print(f"  total                          {human_size(usage.unique_total):>10s}")
+        print(f"  store gc cap                   {cfg.max_size_gb:.1f}GB")
 
     print()
     cache_dirs = [d for d in (uv_dir, ccache_dir) if d is not None]
@@ -432,9 +449,9 @@ def cmd_du(cfg: Config, args) -> int:
         print(f"\ndisk free: {human_size(avail)} on {cfg.cache_dir}")
     except (IndexError, ValueError):
         pass
-    print("note: logical = apparent size (du; reflink-shared blocks counted per "
-          "file); physical = real on-disk blocks, each extent counted once; "
-          "phys·excl = physical freed if that item alone is deleted")
+    print("note: logical counts reflinked files in every venv; delete frees is the "
+          "space reclaimed by deleting that row/subtotal; physical assigns "
+          "store↔venv shared blocks to stores so stores + venvs = total")
 
     if args.entries:
         for store in STORE_NAMES:
@@ -473,6 +490,8 @@ def cmd_hook(cfg: Config, args) -> int:
     if args.event == "post-checkout":
         old, new, flag = (rest + ["", "", ""])[:3]
         return handle_post_checkout(cfg, old, new, flag)
+    if args.event == "post-commit":
+        return handle_post_commit(cfg)
     if args.event == "post-rewrite":
         return handle_post_rewrite(cfg, rest[0] if rest else "")
     return 0

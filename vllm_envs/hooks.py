@@ -1,4 +1,4 @@
-"""Git hooks that keep managed environments synchronized with their checkout."""
+"""post-checkout hook: auto re-resolve layers on commit hops (incl. bisect)."""
 
 import os
 import shutil
@@ -17,20 +17,31 @@ HOOK_SENTINEL = "# installed by ve (vllm-envs)"
 HOOK_TEMPLATE = """#!/bin/sh
 {sentinel}
 hook_dir="$(dirname "$0")"
-if [ -x "$hook_dir/post-checkout.pre-ve" ]; then
-    "$hook_dir/post-checkout.pre-ve" "$@" || exit $?
+if [ -x "$hook_dir/{name}.pre-ve" ]; then
+    "$hook_dir/{name}.pre-ve" "$@" || exit $?
 fi
-exec {ve} hook post-checkout "$1" "$2" "$3"
+exec {ve} hook {name} {args}
 """
 
-POST_REWRITE_HOOK_TEMPLATE = """#!/bin/sh
-{sentinel}
-hook_dir="$(dirname "$0")"
-if [ -x "$hook_dir/post-rewrite.pre-ve" ]; then
-    "$hook_dir/post-rewrite.pre-ve" "$@" || exit $?
-fi
-exec {ve} hook post-rewrite "$1"
-"""
+# Hooks ve installs, with the positional args each forwards to `ve hook <name>`.
+# post-checkout resyncs on commit hops; post-commit catches relevant edits made
+# in-place; post-rewrite resyncs once a rebase finishes (the other hooks defer
+# while a sequencer operation is in progress).
+HOOK_ARGS = {
+    "post-checkout": '"$1" "$2" "$3"',
+    "post-commit": "",
+    "post-rewrite": '"$1"',
+}
+
+# git state files signalling a sequencer op with a transient HEAD.
+SEQUENCER_MARKERS = (
+    "rebase-merge",
+    "rebase-apply",
+    "MERGE_HEAD",
+    "CHERRY_PICK_HEAD",
+    "REVERT_HEAD",
+    "BISECT_LOG",
+)
 
 REQ_WATCH_PATHS = ("requirements",) + BUILD_LAYER_PATHS
 
@@ -43,12 +54,20 @@ def _hooks_dir(repo: Path) -> Path:
     return common_path / "hooks"
 
 
-def _install_hook(repo: Path, name: str, template: str) -> None:
+def install_hook(repo: Path) -> None:
     hooks = _hooks_dir(repo)
     hooks.mkdir(parents=True, exist_ok=True)
-    hook = hooks / name
     ve_bin = shutil.which("ve") or sys.argv[0]
-    content = template.format(sentinel=HOOK_SENTINEL, ve=ve_bin)
+    for name, args in HOOK_ARGS.items():
+        _install_one(hooks, name, ve_bin, args)
+    _exclude_marker(repo)
+
+
+def _install_one(hooks: Path, name: str, ve_bin: str, args: str) -> None:
+    hook = hooks / name
+    content = HOOK_TEMPLATE.format(
+        sentinel=HOOK_SENTINEL, ve=ve_bin, name=name, args=args
+    )
     if hook.exists():
         existing = hook.read_text()
         if HOOK_SENTINEL in existing:
@@ -60,12 +79,6 @@ def _install_hook(repo: Path, name: str, template: str) -> None:
         hook.rename(hooks / f"{name}.pre-ve")
     hook.write_text(content)
     hook.chmod(0o755)
-
-
-def install_hook(repo: Path) -> None:
-    _install_hook(repo, "post-checkout", HOOK_TEMPLATE)
-    _install_hook(repo, "post-rewrite", POST_REWRITE_HOOK_TEMPLATE)
-    _exclude_marker(repo)
 
 
 def _exclude_marker(repo: Path) -> None:
@@ -132,6 +145,45 @@ def _maybe_auto_init(cfg: Config, root: Path) -> int:
     return 0
 
 
+def _sequencer_in_progress(root: Path) -> bool:
+    """True while a rebase/merge/cherry-pick/revert/bisect is underway.
+
+    HEAD is transient during these ops, so syncing the env to it wastes work
+    (rebase resyncs at every `onto` checkout) and races the operation. The env
+    is resynced once the op finishes: rebase/amend via the post-rewrite hook,
+    bisect via the post-checkout on `git bisect reset`.
+    """
+    for name in SEQUENCER_MARKERS:
+        path = run(
+            ["git", "rev-parse", "--git-path", name], cwd=root, check=False
+        ).stdout.strip()
+        if not path:
+            continue
+        p = Path(path)
+        if not p.is_absolute():
+            p = root / p
+        if p.exists():
+            return True
+    return False
+
+
+def _resync(cfg: Config, root: Path) -> int:
+    try:
+        sync(cfg, root)
+    except Exception as e:
+        warn(f"sync failed: {e}")
+        warn("previous .venv retained; its hashes may be STALE for this checkout")
+        return 1
+    return 0
+
+
+def _changed_watch_paths(root: Path, old: str, new: str) -> list[str]:
+    return run(
+        ["git", "diff", "--name-only", old, new, "--", *REQ_WATCH_PATHS],
+        cwd=root,
+    ).stdout.splitlines()
+
+
 def handle_post_checkout(cfg: Config, old: str, new: str, flag: str) -> int:
     if flag == "0":  # file checkout, not a branch/commit switch
         return 0
@@ -149,35 +201,75 @@ def handle_post_checkout(cfg: Config, old: str, new: str, flag: str) -> int:
         return 0  # unmanaged worktree
     if old == new:
         return 0
-    changed = run(
-        ["git", "diff", "--name-only", old, new, "--", *REQ_WATCH_PATHS],
-        cwd=root,
-    ).stdout.strip()
+    if _sequencer_in_progress(root):
+        # e.g. rebase checking out its `onto`; resync once the op completes.
+        say("git rebase/bisect in progress → deferring env sync")
+        return 0
+    changed = _changed_watch_paths(root, old, new)
     if not changed:
         return 0
-    n = len(changed.splitlines())
+    n = len(changed)
     say(f"{n} build/deps-relevant file(s) changed across checkout → syncing env")
+    return _resync(cfg, root)
+
+
+def handle_post_commit(cfg: Config) -> int:
+    """Resync a managed worktree after committing relevant in-place edits."""
+    root = Path(
+        run(["git", "rev-parse", "--show-toplevel"], cwd=Path.cwd()).stdout.strip()
+    )
+    if not (root / MARKER_NAME).exists() or _sequencer_in_progress(root):
+        return 0
+    parent = run(
+        ["git", "rev-parse", "--verify", "--quiet", "HEAD^"],
+        cwd=root,
+        check=False,
+    ).stdout.strip()
+    changed = _changed_watch_paths(root, parent, "HEAD") if parent else ["initial"]
+    if not changed:
+        return 0
+    say(f"{len(changed)} build/deps-relevant file(s) committed → syncing env")
+    return _resync(cfg, root)
+
+
+def _rewrite_range(root: Path) -> tuple[str, str] | None:
+    """(before, after) shas for the rewrite, else None.
+
+    git feeds post-rewrite `<old> <new>` pairs on stdin, oldest-first; the last
+    line's old is the pre-op tip (works for both rebase and amend). Falls back
+    to ORIG_HEAD..HEAD (set by rebase; stale for amend) when stdin is empty.
+    """
     try:
-        sync(cfg, root)
-    except Exception as e:
-        warn(f"sync failed: {e}")
-        warn("previous .venv retained; its hashes may be STALE for this checkout")
-        return 1
-    return 0
+        pairs = [ln.split() for ln in sys.stdin.read().splitlines() if ln.strip()]
+    except Exception:
+        pairs = []
+    if pairs and len(pairs[-1]) >= 2:
+        return pairs[-1][0], pairs[-1][1]
+    orig = run(
+        ["git", "rev-parse", "--verify", "--quiet", "ORIG_HEAD"],
+        cwd=root,
+        check=False,
+    ).stdout.strip()
+    head = run(
+        ["git", "rev-parse", "--verify", "--quiet", "HEAD"], cwd=root, check=False
+    ).stdout.strip()
+    return (orig, head) if orig and head else None
 
 
-def handle_post_rewrite(cfg: Config, command: str) -> int:
-    """Refresh a managed environment after amend or rebase rewrites commits."""
+def handle_post_rewrite(cfg: Config, kind: str) -> int:
+    """Resync after a rebase/amend rewrites HEAD (paired with the mid-op skip)."""
     root = Path(
         run(["git", "rev-parse", "--show-toplevel"], cwd=Path.cwd()).stdout.strip()
     )
     if not (root / MARKER_NAME).exists():
-        return 0
-    say(f"git {command or 'rewrite'} completed → syncing env")
-    try:
-        sync(cfg, root)
-    except Exception as e:
-        warn(f"sync failed: {e}")
-        warn("previous .venv retained; its hashes may be STALE for this checkout")
-        return 1
-    return 0
+        return 0  # unmanaged worktree
+    rng = _rewrite_range(root)
+    if rng and rng[0] != rng[1]:
+        changed = _changed_watch_paths(root, rng[0], rng[1])
+        if not changed:
+            return 0
+        n = len(changed)
+        say(f"{n} build/deps-relevant file(s) changed across {kind} → syncing env")
+    else:
+        say(f"{kind} complete → syncing env")
+    return _resync(cfg, root)

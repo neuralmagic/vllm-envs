@@ -9,7 +9,10 @@ FetchContent (using a per-env FETCHCONTENT_BASE_DIR).
 """
 
 import os
+import json
 import re
+import urllib.parse
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -88,24 +91,84 @@ def _entry_dir(cfg: Config, pin: ExtPin) -> Path:
     return cfg.store("ext-src") / f"{pin.name}-{safe_tag}"
 
 
+def _github_full_ref(repo: str, ref: str) -> str | None:
+    """Expand a short GitHub SHA, including commits no longer on a branch."""
+    if not re.fullmatch(r"[0-9a-fA-F]{7,39}", ref):
+        return None
+    parsed = urllib.parse.urlparse(repo.removesuffix(".git"))
+    if parsed.hostname != "github.com":
+        return None
+    parts = parsed.path.strip("/").split("/")
+    if len(parts) != 2:
+        return None
+    url = f"https://api.github.com/repos/{parts[0]}/{parts[1]}/commits/{ref}"
+    request = urllib.request.Request(
+        url,
+        headers={
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "vllm-envs",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            sha = json.load(response).get("sha", "")
+    except (OSError, ValueError):
+        return None
+    return sha if re.fullmatch(r"[0-9a-fA-F]{40}", sha) else None
+
+
+def fetch_ref(repo: str, ref: str, dest: Path, label: str) -> None:
+    """Create a checkout by fetching only the requested tag/commit."""
+    if dest.exists():
+        run(["rm", "-rf", str(dest)])
+    dest.mkdir(parents=True)
+    run(["git", "init", "--quiet"], cwd=dest)
+    run(["git", "remote", "add", "origin", repo], cwd=dest)
+    fetch = run(
+        ["git", "fetch", "--depth=1", "origin", ref],
+        cwd=dest,
+        check=False,
+    )
+    if fetch.returncode != 0:
+        expanded = _github_full_ref(repo, ref)
+        if expanded is None:
+            raise RuntimeError(f"cannot fetch {repo} at {ref}")
+        run(
+            ["git", "fetch", "--depth=1", "origin", expanded],
+            cwd=dest,
+            stream_prefix=f"[ve]   [{label}] ",
+        )
+    run(["git", "checkout", "--quiet", "--detach", "FETCH_HEAD"], cwd=dest)
+    _ensure_submodules(dest, label)
+
+
+def _ensure_submodules(dest: Path, label: str) -> None:
+    if (dest / ".gitmodules").is_file():
+        status = run(
+            ["git", "submodule", "status", "--recursive"], cwd=dest, check=False
+        )
+        if status.returncode != 0 or any(
+            line.startswith(("-", "+")) for line in status.stdout.splitlines()
+        ):
+            run(
+                [
+                    "git", "submodule", "update", "--init", "--recursive",
+                    "--depth=1",
+                ],
+                cwd=dest,
+                stream_prefix=f"[ve]   [{label}] ",
+            )
+
+
 def ensure_ext_src(cfg: Config, pin: ExtPin) -> Path:
     entry = _entry_dir(cfg, pin)
     with entry_lock(entry):
         if entry.is_dir() and (entry / ".complete").exists():
+            _ensure_submodules(entry, pin.name)
             touch_last_used(entry)
             return entry
         say(f"ext-src: cloning {pin.name} @ {pin.tag}")
-        if entry.exists():
-            run(["rm", "-rf", str(entry)])
-        clone = ["git", "clone", "--filter=blob:none", pin.repo, str(entry)]
-        run(clone, stream_prefix=f"[ve]   [{pin.name}] ")
-        run(["git", "checkout", "--quiet", pin.tag], cwd=entry)
-        if pin.submodules:
-            run(
-                ["git", "submodule", "update", "--init", "--recursive"],
-                cwd=entry,
-                stream_prefix=f"[ve]   [{pin.name}] ",
-            )
+        fetch_ref(pin.repo, pin.tag, entry, pin.name)
         (entry / ".complete").touch()
         write_meta(entry, {"project": pin.name, "tag": pin.tag, "repo": pin.repo})
         touch_last_used(entry)
