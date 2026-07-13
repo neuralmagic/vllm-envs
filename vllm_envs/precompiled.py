@@ -45,23 +45,25 @@ def _build_inputs_match(root: Path, commit: str) -> bool:
 
 
 def _candidate_commits(root: Path, limit: int = 10) -> list[str]:
-    """Main ancestors (newest first) whose build inputs are identical to HEAD.
+    """Exact HEAD, then main ancestors whose build inputs are identical.
 
-    Starts at the merge-base with main and walks first-parent history until
-    the build inputs diverge — any of these commits' wheels contains the same
-    compiled extensions this tree would build.
+    An exact-commit wheel is always safe for a clean worktree and is commonly
+    published for release branches. If unavailable, walk from the merge-base
+    through first-parent history while build inputs remain identical to HEAD.
     """
+    head = git(["rev-parse", "HEAD"], cwd=root)
+    candidates = [head]
     base = _base_main_commit(root)
     if not base:
-        return []
+        return candidates
     ancestors = git(
         ["rev-list", "--first-parent", "-n", str(limit), base], cwd=root
     ).splitlines()
-    candidates: list[str] = []
     for c in ancestors:
         if not _build_inputs_match(root, c):
             break
-        candidates.append(c)
+        if c not in candidates:
+            candidates.append(c)
     return candidates
 
 

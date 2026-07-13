@@ -24,9 +24,10 @@ class PrecompiledFallbackIntegrationTest(unittest.TestCase):
             patch("vllm_envs.layers.build_key", return_value="build-key"),
             patch("vllm_envs.layers.build_paths_dirty", return_value=False),
             patch("vllm_envs.layers.user_overrides", return_value={}),
+            patch("vllm_envs.layers.try_fetch_precompiled", return_value=None),
             patch("vllm_envs.layers.editable.editable_present", return_value=True),
         ):
-            resolution = resolve_build(Config(), root, venv)
+            resolution = resolve_build(Config(cache_dir=root / "cache"), root, venv)
 
         self.assertEqual(
             resolution,

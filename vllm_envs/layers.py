@@ -381,17 +381,6 @@ def resolve_build(cfg: Config, env_root: Path, venv: Path) -> BuildResolution:
     dirty = build_paths_dirty(env_root)
     marker = read_marker(env_root)
 
-    if (
-        not overrides
-        and not dirty
-        and marker.get("build_hash") == bhash
-        and marker.get("attach_mode") == "precompiled-fetch"
-        and editable.editable_present(venv)
-        and any((env_root / "vllm").glob("*.so"))
-    ):
-        say(f"build layer: env-local precompiled fallback up to date ({bhash})")
-        return BuildResolution("precompiled-fetch", None, bhash, shared=False)
-
     if overrides:
         say(f"build-layer caching disabled: local overrides active "
             f"({', '.join(overrides)}) — building privately")
@@ -417,6 +406,18 @@ def resolve_build(cfg: Config, env_root: Path, venv: Path) -> BuildResolution:
             fetched = try_fetch_precompiled(cfg, env_root, bhash)
             if fetched is not None:
                 return BuildResolution("precompiled-fetch", fetched, bhash, shared=True)
+            if (
+                marker.get("build_hash") == bhash
+                and marker.get("attach_mode") == "precompiled-fetch"
+                and editable.editable_present(venv)
+                and any((env_root / "vllm").glob("*.so"))
+            ):
+                say(
+                    f"build layer: env-local precompiled fallback up to date ({bhash})"
+                )
+                return BuildResolution(
+                    "precompiled-fetch", None, bhash, shared=False
+                )
             build_temp = cfg.store("cmake-build") / bhash
             dist_dir = _scratch(env_root) / "dist"
             try:
