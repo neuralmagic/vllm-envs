@@ -277,7 +277,7 @@ def cmd_status(cfg: Config, args) -> int:
     platform = cfg.platform or detect_platform()
     keys = venv_keys(root, platform, cfg.python,
                      with_test=cfg.with_test, cap=cfg.cap)
-    bhash = build_key(root, platform, cfg.python)
+    bhash = build_key(root, platform, cfg.python, root / ".venv")
     head = git(["rev-parse", "--short", "HEAD"], cwd=root)
     overrides = user_overrides()
     dirty = build_paths_dirty(root)
@@ -299,7 +299,11 @@ def cmd_status(cfg: Config, args) -> int:
     if m.get("attach_mode") == "local-build":
         build_state = "private (dirty/override build)"
     elif m.get("attach_mode") == "precompiled-fetch" and m.get("build_hash") == bhash:
-        build_state = "OK (env-local precompiled fallback)"
+        cached_wheel = next((cfg.store("builds") / bhash).glob("vllm-*.whl"), None)
+        build_state = (
+            "OK (cached precompiled)" if cached_wheel is not None
+            else "OK (env-local precompiled fallback)"
+        )
     print(f"build:      {bhash}  {build_state}")
     if cfg.with_deepep and platform == "cuda":
         try:

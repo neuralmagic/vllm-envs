@@ -329,6 +329,30 @@ def _scratch(env_root: Path) -> Path:
     return p
 
 
+def local_build_env(env_root: Path, venv: Path | None = None) -> dict[str, str]:
+    """Environment shared by every local C/C++/CUDA compilation."""
+    env = {
+        "VLLM_DISABLE_SCCACHE": "1",  # local ccache policy
+        # Build directories are content-addressed but differ across build
+        # hashes. Do not let RelWithDebInfo's compilation directory defeat
+        # ccache reuse for unchanged translation units across commit hops.
+        "CCACHE_NOHASHDIR": "true",
+        "CMAKE_C_COMPILER_LAUNCHER": "ccache",
+        "CMAKE_CXX_COMPILER_LAUNCHER": "ccache",
+        "CMAKE_CUDA_COMPILER_LAUNCHER": "ccache",
+        # Per-env fetchcontent dir: no cross-env build-dir races for any
+        # project we couldn't pin.
+        "FETCHCONTENT_BASE_DIR": str(_scratch(env_root) / "fetchcontent"),
+    }
+    if venv is not None:
+        # Running the venv's Python does not update PATH for subprocesses that
+        # setup.py/CMake launch. Make its approved cmake/ninja executables
+        # authoritative instead of depending on the invoking shell.
+        env["VIRTUAL_ENV"] = str(venv)
+        env["PATH"] = f"{venv / 'bin'}{os.pathsep}{os.environ.get('PATH', os.defpath)}"
+    return env
+
+
 def _build_wheel(
     cfg: Config,
     env_root: Path,
@@ -337,18 +361,14 @@ def _build_wheel(
     dist_dir: Path,
     use_pinned_ext: bool,
 ) -> Path:
-    env = {
-        "VLLM_DISABLE_SCCACHE": "1",  # local ccache policy
-        "CMAKE_C_COMPILER_LAUNCHER": "ccache",
-        "CMAKE_CXX_COMPILER_LAUNCHER": "ccache",
-        "CMAKE_CUDA_COMPILER_LAUNCHER": "ccache",
-        # per-env fetchcontent dir: no cross-env build-dir races for any
-        # project we couldn't pin
-        "FETCHCONTENT_BASE_DIR": str(_scratch(env_root) / "fetchcontent"),
-    }
+    env = local_build_env(env_root, venv)
     if use_pinned_ext:
         env.update(src_dir_env(cfg, env_root))
     build_temp.mkdir(parents=True, exist_ok=True)
+    # This scratch directory survives commit hops. Never let _find_wheel pick
+    # a successful wheel left by a different branch/build hash.
+    if dist_dir.exists():
+        shutil.rmtree(dist_dir)
     dist_dir.mkdir(parents=True, exist_ok=True)
     say(f"building extensions (ccache, build dir {build_temp})...")
     t0 = time.time()
@@ -360,6 +380,12 @@ def _build_wheel(
             "--build-temp",
             str(build_temp),
             "bdist_wheel",
+            # The explicit build_ext above already compiled and installed all
+            # extension outputs into build/lib. Without this, bdist_wheel runs
+            # build_ext a second time in the same Python process; modern vLLM
+            # skips CMake configure via its did_config guard and can then fail
+            # with "Error: could not load cache".
+            "--skip-build",
             "--dist-dir",
             str(dist_dir),
         ],
@@ -376,7 +402,7 @@ def _build_wheel(
 
 def resolve_build(cfg: Config, env_root: Path, venv: Path) -> BuildResolution:
     platform = cfg.platform or detect_platform()
-    bhash = build_key(env_root, platform, cfg.python)
+    bhash = build_key(env_root, platform, cfg.python, venv)
     overrides = user_overrides()
     dirty = build_paths_dirty(env_root)
     marker = read_marker(env_root)

@@ -80,7 +80,7 @@ An env is just a git worktree plus a private `.venv`, assembled from shared cont
 | `venvs/` | full deps (derived from `venvs-base`); test deps too when `[venv] test` is on | base key + runtime (+ test) requirements |
 | `ep-kernels/` | DeepEP wheel and its NVSHMEM runtime | vLLM installer + Docker pin + venv/CUDA inputs |
 | `ext-src/` | pinned external sources (cutlass, flash-attn, ...) | project + pin parsed from the worktree's cmake files |
-| `builds/` | compiled-extension wheel + extracted-file mirror + editable-install replay | content hash of csrc/ cmake/ CMakeLists.txt setup.py (+ python/CUDA) |
+| `builds/` | compiled-extension wheel + extracted-file mirror + editable-install replay | source + Python/Torch ABI + host/compiler/CUDA/GPU target + build flags |
 | `cmake-build/` | persistent cmake trees for incremental local builds | same hash as `builds/` |
 
 ```mermaid
@@ -109,7 +109,7 @@ flowchart LR
 `ve sync` (run by `ve new`/`ve init` and the post-checkout hook) resolves three layers, skipping whatever is already consistent:
 
 1. **venv** — requirements files are hashed; on a hit the env's `.venv` is reflink-cloned from the cached template (CoW: edit site-packages freely, other envs are unaffected). Templates are derived `venvs-base` → `venvs`, so a runtime-requirements change only re-installs the delta. On a commit hop the private venv is converged in place (top-up install + uninstall of dropped deps).
-2. **build** — csrc/cmake/setup.py content is hashed. Clean-tree resolution order: store hit → precompiled wheel from wheels.vllm.ai (when the tree matches the origin/main merge-base; published into the store) → local ccache build, with `ext-src/` pins injected via `*_SRC_DIR` env vars and a persistent per-hash cmake tree for incremental rebuilds. Dirty csrc/ or user `*_SRC_DIR` overrides → private builds, never published.
+2. **build** — csrc/cmake/setup.py content is hashed together with the effective Python/Torch ABI, host/compiler/CUDA toolchains, GPU target, and build flags. Clean-tree resolution order: store hit → exact-commit or compatible-main precompiled wheel from wheels.vllm.ai (published into the store) → local ccache build (also published), with `ext-src/` pins injected via `*_SRC_DIR` env vars and a persistent per-hash cmake tree for incremental rebuilds. Local builds disable sccache and set `CCACHE_NOHASHDIR=true`, allowing unchanged translation units to hit across content-addressed build directories. Dirty csrc/ or user `*_SRC_DIR` overrides → private builds, never published.
 3. **attach** — makes the worktree importable as an editable install: the wheel's `.so` files and bundled third-party py files are placed into the worktree as reflinks of the shared mirror in `builds/<hash>/extracted/` (~450MB physical shared per env), and the editable-install artifacts (`.pth`, finder, dist-info) are written into the venv. The first attach at a build hash runs vLLM's own setup.py once (historically correct extraction for old releases) and captures the result; later attaches at the same commit replay it with no setup.py run, and an already-attached env is a no-op.
 
 Warm-cache timing: fresh `ve new`/`ve init` ~7s, no-op `ve sync` ~1s; a cold build costs one normal vLLM build, then every env at that hash shares it.

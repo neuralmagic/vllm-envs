@@ -8,6 +8,7 @@ their own keys and can never collide with clean-commit artifacts.
 import hashlib
 import json
 import os
+import platform as host_platform
 import re
 import subprocess
 from dataclasses import dataclass, field
@@ -19,6 +20,10 @@ from .config import BUILD_LAYER_PATHS, DEFAULT_CACHE_DIR
 from .util import run
 
 TORCH_PIN_RE = re.compile(r"^(torch|torchaudio|torchvision|nvidia-|triton)", re.I)
+GENERATED_BUILD_OUTPUT_RE = re.compile(
+    r"^csrc/(?:libtorch_stable/)?(?:quantization/marlin|moe/marlin_moe_wna16)/"
+    r"(?:sm\d+_kernel_.*\.cu|kernel_selector\.h)$"
+)
 
 
 @lru_cache(maxsize=1)
@@ -53,7 +58,9 @@ def cuda_version() -> str:
     ver = "unknown"
     try:
         out = run(["nvidia-smi"], check=False).stdout
-        if m := re.search(r"CUDA Version:\s*(\d+\.\d+)", out):
+        # Newer drivers label this "CUDA UMD Version" while older releases
+        # use "CUDA Version".
+        if m := re.search(r"CUDA(?: UMD)? Version:\s*(\d+\.\d+)", out):
             ver = m.group(1)
     except Exception:
         pass
@@ -226,11 +233,22 @@ def venv_keys(
 
 def worktree_content_hash(root: Path, paths: tuple[str, ...]) -> str:
     """Hash working-tree contents of the given paths (tracked+modified+untracked)."""
-    listed = run(
-        ["git", "ls-files", "-cmo", "--exclude-standard", "-z", "--", *paths],
+    tracked = run(
+        ["git", "ls-files", "-cm", "-z", "--", *paths],
         cwd=root,
-    ).stdout
-    files = sorted({f for f in listed.split("\0") if f})
+    ).stdout.split("\0")
+    untracked = run(
+        ["git", "ls-files", "-o", "--exclude-standard", "-z", "--", *paths],
+        cwd=root,
+    ).stdout.split("\0")
+    # Several vLLM releases generate Marlin instantiations into csrc itself.
+    # They survive a checkout because Git preserves untracked files, but they
+    # are build outputs rather than user source edits. Never ignore a tracked
+    # path, even if a future release starts committing one of these files.
+    files = sorted(
+        {f for f in tracked if f}
+        | {f for f in untracked if f and not GENERATED_BUILD_OUTPUT_RE.match(f)}
+    )
     present = [f for f in files if (root / f).is_file()]
     deleted = [f for f in files if not (root / f).exists()]
     blob_hashes: list[str] = []
@@ -249,15 +267,187 @@ def worktree_content_hash(root: Path, paths: tuple[str, ...]) -> str:
     return _sha(["v1", *parts])
 
 
-def build_key(root: Path, platform: str, python: str) -> str:
+_BUILD_ENV_NAMES = {
+    "CC", "CFLAGS", "CMAKE_ARGS", "CUDA_HOME", "CUDA_PATH",
+    "CUDA_VISIBLE_DEVICES", "CXX", "CXXFLAGS", "LDFLAGS",
+    "NVCC_APPEND_FLAGS", "TORCH_CUDA_ARCH_LIST",
+}
+_BUILD_ENV_PREFIXES = ("CMAKE_", "CUDA_", "TORCH_", "VLLM_")
+
+
+def _command_identity(command: str, *args: str) -> str:
+    """Return a stable identity for a tool selected by this environment."""
+    executable = which(command)
+    if executable is None:
+        return f"{command}:missing"
+    try:
+        proc = subprocess.run(
+            [executable, *args], capture_output=True, text=True, timeout=10
+        )
+        output = (proc.stdout + proc.stderr).strip()
+    except (OSError, subprocess.SubprocessError) as exc:
+        output = f"error:{type(exc).__name__}"
+    # Resolve symlinks such as /usr/local/cuda -> cuda-13.0.
+    return f"{Path(executable).resolve()}\n{output}"
+
+
+def _distribution_identity(venv: Path, package: str) -> str:
+    """Fingerprint an installed wheel without importing its package."""
+    candidates = sorted(
+        p
+        for lib in venv.glob("lib*")
+        for p in lib.glob(f"python*/site-packages/{package}-*.dist-info")
+        if p.is_dir()
+    )
+    if not candidates:
+        return f"{package}:missing"
+    dist = candidates[-1]
+    parts = [dist.name]
+    # RECORD captures the wheel's file hashes. METADATA and WHEEL cover
+    # incomplete/nonstandard RECORD files.
+    for name in ("METADATA", "WHEEL", "RECORD"):
+        path = dist / name
+        parts.append(f"{name}:{_hash_file(path) if path.is_file() else 'missing'}")
+    return "\n".join(parts)
+
+
+def _build_distributions_identity(venv: Path) -> str:
+    # setup.py executes against this venv, so these packages can affect the
+    # generated wheel even when the source and system compiler are unchanged.
+    return "\n".join(
+        _distribution_identity(venv, package)
+        for package in ("torch", "setuptools", "wheel", "cmake", "ninja")
+    )
+
+
+def _python_abi_identity(venv: Path, configured_python: str) -> str:
+    cfg = venv / "pyvenv.cfg"
+    values: dict[str, str] = {}
+    if cfg.is_file():
+        for line in cfg.read_text(errors="replace").splitlines():
+            key, sep, value = line.partition("=")
+            if sep:
+                values[key.strip().lower()] = value.strip()
+    return ":".join([
+        configured_python,
+        values.get("implementation", "cpython"),
+        values.get("version", values.get("version_info", "unknown")),
+    ])
+
+
+def _cuda_toolkit_identity() -> str:
+    for variable in ("CMAKE_CUDA_COMPILER", "NVCC"):
+        if value := os.environ.get(variable):
+            path = Path(value).expanduser()
+            if path.is_file():
+                return _command_identity(str(path), "--version")
+    for variable in ("CUDA_HOME", "CUDA_PATH"):
+        if value := os.environ.get(variable):
+            path = Path(value).expanduser() / "bin" / "nvcc"
+            if path.is_file():
+                return _command_identity(str(path), "--version")
+    default = Path("/usr/local/cuda/bin/nvcc")
+    if default.is_file():
+        return _command_identity(str(default), "--version")
+    return _command_identity("nvcc", "--version")
+
+
+def _gpu_target_identity() -> str:
+    if arches := os.environ.get("TORCH_CUDA_ARCH_LIST"):
+        return f"TORCH_CUDA_ARCH_LIST={arches}"
+    # Reading the driver's inventory is effectively free, unlike spawning
+    # nvidia-smi (~100-500ms). The ordered model list plus the separately
+    # hashed CUDA_VISIBLE_DEVICES/CUDA_DEVICE_ORDER identifies the same set of
+    # auto-detected compilation targets without tying reuse to GPU UUIDs.
+    inventory = Path("/proc/driver/nvidia/gpus")
+    models: list[str] = []
+    if inventory.is_dir():
+        for info in sorted(inventory.glob("*/information")):
+            try:
+                model = next(
+                    line.partition(":")[2].strip()
+                    for line in info.read_text(errors="replace").splitlines()
+                    if line.startswith("Model:")
+                )
+            except (OSError, StopIteration):
+                continue
+            models.append(model)
+    if models:
+        return "driver-models:" + "|".join(models)
+    executable = which("nvidia-smi")
+    if executable is None:
+        return "gpu-target:unavailable"
+    # PyTorch auto-detects the visible GPUs when no target list is supplied.
+    # Model names conservatively distinguish targets on older drivers that do
+    # not expose the compute_cap query field.
+    for fields in ("compute_cap,name", "name"):
+        try:
+            proc = subprocess.run(
+                [executable, f"--query-gpu={fields}", "--format=csv,noheader"],
+                capture_output=True, text=True, timeout=10,
+            )
+            rows = sorted({line.strip() for line in proc.stdout.splitlines()
+                           if line.strip()})
+            if proc.returncode == 0 and rows:
+                return f"{fields}:" + "|".join(rows)
+        except (OSError, subprocess.SubprocessError):
+            break
+    return "gpu-target:unknown"
+
+
+def _build_environment_identity() -> str:
+    values = {
+        name: value for name, value in os.environ.items()
+        if name in _BUILD_ENV_NAMES or name.startswith(_BUILD_ENV_PREFIXES)
+    }
+    # These control ve's attach mechanism, not local compiler output.
+    values.pop("VLLM_USE_PRECOMPILED", None)
+    values.pop("VLLM_PRECOMPILED_WHEEL_LOCATION", None)
+    return json.dumps(values, sort_keys=True, separators=(",", ":"))
+
+
+def build_key(root: Path, platform: str, python: str, venv: Path) -> str:
+    """Hash every input that can affect a reusable compiled vLLM wheel."""
     cuda = cuda_version() if platform == "cuda" else "n/a"
     tree = worktree_content_hash(root, BUILD_LAYER_PATHS)
-    return _sha(["v1", platform, python, cuda, tree])
+    def venv_tool(name: str) -> str:
+        candidate = venv / "bin" / name
+        return str(candidate) if candidate.is_file() else name
+
+    compiler = "\n".join([
+        _command_identity(os.environ.get("CC", "cc"), "--version"),
+        _command_identity(os.environ.get("CXX", "c++"), "--version"),
+        _command_identity(venv_tool("cmake"), "--version"),
+        _command_identity(venv_tool("ninja"), "--version"),
+    ])
+    libc_name, libc_version = host_platform.libc_ver()
+    parts = [
+        # v3: local compilation no longer hashes its build directory in
+        # ccache. Keep directory-sensitive local wheels in their old keys.
+        "v3", platform,
+        _python_abi_identity(venv, python),
+        f"host:{host_platform.system()}:{host_platform.machine()}:{libc_name}:{libc_version}",
+        f"cuda-driver:{cuda}", f"source:{tree}",
+        f"build-distributions:{_build_distributions_identity(venv)}",
+        f"compiler:{compiler}",
+        f"env:{_build_environment_identity()}",
+    ]
+    if platform == "cuda":
+        parts.extend([
+            f"cuda-toolkit:{_cuda_toolkit_identity()}",
+            f"gpu-target:{_gpu_target_identity()}",
+        ])
+    return _sha(parts)
 
 
 def build_paths_dirty(root: Path) -> bool:
     """True if the working tree is dirty for build-layer paths."""
-    out = run(
-        ["git", "status", "--porcelain", "--", *BUILD_LAYER_PATHS], cwd=root
-    ).stdout.strip()
-    return bool(out)
+    lines = run(
+        ["git", "status", "--porcelain", "--untracked-files=all", "--",
+         *BUILD_LAYER_PATHS], cwd=root
+    ).stdout.splitlines()
+    for line in lines:
+        if line.startswith("?? ") and GENERATED_BUILD_OUTPUT_RE.match(line[3:]):
+            continue
+        return True
+    return False
