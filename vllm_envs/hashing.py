@@ -145,6 +145,24 @@ _FLOOR_RE = re.compile(r">=?\s*v?(\d+(?:\.\d+)*)")
 _CEILING_RE = re.compile(r"<|==|~=")
 
 
+def requirement_names(files: list[Path]) -> set[str]:
+    names = set()
+    for f in files:
+        for raw in f.read_text(errors="replace").splitlines():
+            line = raw.split("#", 1)[0].strip()
+            if not line or line.startswith("-") or "://" in line:
+                continue
+            if match := _REQ_NAME_RE.match(line):
+                names.add(match.group(1).lower().replace("_", "-"))
+    return names
+
+
+def _derived_requirement_parts(files: list[Path]) -> list[str]:
+    if "flashinfer-python" in requirement_names(files):
+        return ["derived:flashinfer-jit-cache:v1"]
+    return []
+
+
 def cap_constraints(files: list[Path], mode: str) -> str:
     """Constraint lines capping requirements that have a version floor but no
     ceiling: `pkg>=X.Y.Z` → `pkg<X.(Y+1)` (minor) or `pkg<(X+1)` (major), so
@@ -218,6 +236,7 @@ def venv_keys(
         # cap="none" stays un-folded so pre-capping templates keep their keys
         *([f"cap:{cap}"] if cap != "none" else []),
         *(f"{p.name}:{_hash_file(p)}" for p in layout.build_files),
+        *_derived_requirement_parts(layout.build_files),
         # torch pins from runtime files fold into the base key so a torch bump
         # rebuilds the base template instead of a heavy top-up in the full layer
         *torch_pin_lines(layout.runtime_files),
@@ -227,6 +246,7 @@ def venv_keys(
         base_hash,
         *(f"{p.relative_to(root)}:{_hash_file(p)}" for p in layout.runtime_files),
         *(f"{p.relative_to(root)}:{_hash_file(p)}" for p in layout.test_files),
+        *_derived_requirement_parts([*layout.runtime_files, *layout.test_files]),
     ]
     return VenvKeys(base_hash, _sha(full_parts), layout)
 

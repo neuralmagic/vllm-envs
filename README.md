@@ -23,8 +23,17 @@ source .venv/bin/activate   # plain venv — always works
 **New worktrees become envs automatically.** After `ve init` (or `ve new`) has run once in a repo, its worktree hook auto-initializes every new worktree:
 
 ```bash
-git worktree add ../my-feature my-branch   # auto-runs ve init
+git worktree add -b my-branch ../my-feature
 cd ../my-feature && source .venv/bin/activate
+```
+
+Omit `-b` only when the branch already exists. If `VE_NO_AUTO_INIT=1`, the hook
+skips environment creation and you must run `ve init` in the new worktree:
+
+```bash
+cd ../my-feature
+ve init
+source .venv/bin/activate
 ```
 
 **Or spawn disposable envs by ref** (created under `~/vllm-envs/`):
@@ -35,6 +44,9 @@ ve new v0.13.0 --name bisect1
 ```
 
 Inside an env you can `git checkout <sha>` / `git bisect` freely — a hook re-syncs the layers on each hop. Optionally add `eval "$(ve shellenv)"` to your shell rc, then `ve activate` sources the venv from anywhere inside an env.
+
+The first few environment setups can be slow while dependency and build caches
+populate. Setup gets faster with continued use as more layers become cache hits.
 
 **Everyday commands:**
 
@@ -68,7 +80,9 @@ ve reap <name>      # reap one by name or path
 
 Reaping is gated: a worktree with uncommitted changes or un-pushed commits is skipped (add `--force` to override, `--dry-run` to preview). Active, primary, and non-t3 worktrees are never touched without `--force`.
 
-Set `VE_NO_AUTO_INIT=1` to skip auto-init for a single `git worktree add`.
+Prefix a single command with `VE_NO_AUTO_INIT=1` to skip auto-init. Avoid
+exporting it globally; if it is already exported, use `VE_NO_AUTO_INIT=` to
+enable auto-init for a worktree command.
 
 ## How it works
 
@@ -137,6 +151,10 @@ deepep = true   # install DeepEP in every CUDA env; VE_WITH_DEEPEP overrides
 With `test = true` (the default) the `venvs/` layer also installs vLLM's test
 dependencies (`pytest`, `lm-eval`, ...), cached and reflink-shared like the rest;
 set `test = false` (or `VE_WITH_TEST=0`) to keep envs lean.
+
+When a CUDA vLLM checkout requires `flashinfer-python`, `ve` also installs the
+matching `flashinfer-jit-cache` wheel from FlashInfer's CUDA-specific index.
+This derived dependency is required and has no opt-out.
 
 CUDA environments install DeepEP by default using vLLM's
 `tools/ep_kernels/install_python_libraries.sh`. The DeepEP commit follows

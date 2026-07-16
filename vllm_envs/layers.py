@@ -19,6 +19,7 @@ from .hashing import (
     build_paths_dirty,
     cap_constraints,
     detect_platform,
+    requirement_names,
     venv_keys,
 )
 from .locks import entry_lock
@@ -87,14 +88,61 @@ def _torch_backend_args(platform: str, requirement_files: list[Path]) -> list[st
     return args
 
 
+def _install_flashinfer_jit_cache(
+    venv: Path, platform: str, requirement_files: list[Path]
+) -> None:
+    if platform != "cuda" or "flashinfer-python" not in requirement_names(
+        requirement_files
+    ):
+        return
+
+    package = run(
+        [
+            "uv",
+            "pip",
+            "show",
+            "--python",
+            str(venv / "bin" / "python"),
+            "flashinfer-python",
+        ]
+    ).stdout
+    version_match = re.search(r"^Version:\s*(\S+)", package, re.MULTILINE)
+    if version_match is None:
+        raise RuntimeError("flashinfer-python is required but was not installed")
+    version = version_match.group(1).split("+", 1)[0]
+
+    torch_cuda = run(
+        [
+            str(venv / "bin" / "python"),
+            "-c",
+            "import torch; print(torch.version.cuda or '')",
+        ]
+    ).stdout.strip()
+    cuda_match = re.fullmatch(r"(\d+)\.(\d+)", torch_cuda)
+    if cuda_match is None:
+        raise RuntimeError(
+            "cannot select the FlashInfer JIT cache without CUDA version"
+        )
+    cuda_variant = "".join(cuda_match.groups())
+    _uv_pip(
+        venv,
+        [
+            f"flashinfer-jit-cache=={version}",
+            "--index-url",
+            f"https://flashinfer.ai/whl/cu{cuda_variant}",
+        ],
+    )
+
+
 def _install_reqs(
-    cfg: Config, keys: VenvKeys, venv: Path, req_args: list[str],
+    cfg: Config, keys: VenvKeys, venv: Path, requirement_files: list[Path],
     platform: str, cap_dest: Path,
 ) -> None:
     """Install requirements with cap constraints, walking down the fallback
     chain (minor → major → none) when caps make resolution unsatisfiable —
     stale floors (e.g. tokenizers>=0.21 vs transformers needing >=0.22) can
     conflict under tight caps."""
+    req_args = [arg for f in requirement_files for arg in ("-r", str(f))]
     mode = cfg.cap
     while True:
         content = cap_constraints(
@@ -133,13 +181,19 @@ def _install_reqs(
                 continue
         try:
             _uv_pip(venv, install_args)
-            return
         except subprocess.CalledProcessError:
             nxt = _CAP_FALLBACK.get(mode)
             if not cap_args or nxt is None:
                 raise
             say(f"venv layer: cap={mode} incompatible → trying cap={nxt}")
             mode = nxt
+            continue
+        _install_flashinfer_jit_cache(
+            venv,
+            platform,
+            requirement_files,
+        )
+        return
 
 
 def _venv_freeze(venv: Path) -> list[str]:
@@ -181,11 +235,9 @@ def ensure_base_template(cfg: Config, keys: VenvKeys, platform: str) -> Path:
         if entry.exists():
             shutil.rmtree(entry)
         run(["uv", "venv", "--python", cfg.python, str(entry)])
-        req_args: list[str] = []
-        for f in keys.layout.build_files:
-            req_args += ["-r", str(f)]
-        if req_args:
-            _install_reqs(cfg, keys, entry, req_args, platform,
+        requirement_files = keys.layout.build_files
+        if requirement_files:
+            _install_reqs(cfg, keys, entry, requirement_files, platform,
                           entry / "constraints.txt")
         (entry / ".complete").touch()
         write_meta(entry, {"kind": "venv-base", "hash": keys.base_hash})
@@ -207,11 +259,9 @@ def ensure_full_template(cfg: Config, keys: VenvKeys, platform: str) -> Path:
         reflink_clone(base, entry)
         _rewrite_venv_paths(base, entry)
         (entry / ".complete").unlink(missing_ok=True)
-        req_args: list[str] = []
-        for f in [*keys.layout.runtime_files, *keys.layout.test_files]:
-            req_args += ["-r", str(f)]
-        if req_args:
-            _install_reqs(cfg, keys, entry, req_args, platform,
+        requirement_files = [*keys.layout.runtime_files, *keys.layout.test_files]
+        if requirement_files:
+            _install_reqs(cfg, keys, entry, requirement_files, platform,
                           entry / "constraints.txt")
         (entry / "freeze.txt").write_text("\n".join(_venv_freeze(entry)) + "\n")
         (entry / ".complete").touch()
@@ -240,11 +290,12 @@ def resolve_venv(cfg: Config, env_root: Path, fresh: bool = False) -> tuple[Path
             say(f"venv layer: requirements changed → top-up install into env venv "
                 f"({current} → {keys.full_hash})")
             template = ensure_full_template(cfg, keys, platform)
-            req_args: list[str] = []
-            for f in [*keys.layout.runtime_files, *keys.layout.test_files]:
-                req_args += ["-r", str(f)]
-            if req_args:
-                _install_reqs(cfg, keys, venv, req_args, platform,
+            requirement_files = [
+                *keys.layout.runtime_files,
+                *keys.layout.test_files,
+            ]
+            if requirement_files:
+                _install_reqs(cfg, keys, venv, requirement_files, platform,
                               _scratch(env_root) / "constraints.txt")
             _uninstall_removed_deps(env_root, venv, template)
             update_marker(env_root, venv_full_hash=keys.full_hash, venv_base_hash=keys.base_hash)

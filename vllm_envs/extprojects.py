@@ -11,6 +11,7 @@ FetchContent (using a per-env FETCHCONTENT_BASE_DIR).
 import os
 import json
 import re
+import shutil
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
@@ -136,7 +137,19 @@ def _github_full_ref(repo: str, ref: str) -> str | None:
         with urllib.request.urlopen(request, timeout=30) as response:
             sha = json.load(response).get("sha", "")
     except (OSError, ValueError):
-        return None
+        sha = ""
+    if not re.fullmatch(r"[0-9a-fA-F]{40}", sha) and shutil.which("gh"):
+        response = run(
+            [
+                "gh",
+                "api",
+                f"repos/{parts[0]}/{parts[1]}/commits/{ref}",
+                "--jq",
+                ".sha",
+            ],
+            check=False,
+        )
+        sha = response.stdout.strip() if response.returncode == 0 else ""
     return sha if re.fullmatch(r"[0-9a-fA-F]{40}", sha) else None
 
 

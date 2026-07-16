@@ -3,9 +3,32 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
-from vllm_envs.extprojects import fetch_ref
+from vllm_envs.extprojects import _github_full_ref, fetch_ref
+
+
+class GitHubRefResolutionTest(unittest.TestCase):
+    def test_uses_authenticated_cli_when_anonymous_api_fails(self):
+        sha = "73b6ea4a439ba03a695563f9fd242c8e4b02b37c"
+        with (
+            patch(
+                "vllm_envs.extprojects.urllib.request.urlopen",
+                side_effect=OSError,
+            ),
+            patch("vllm_envs.extprojects.shutil.which", return_value="/usr/bin/gh"),
+            patch(
+                "vllm_envs.extprojects.run",
+                return_value=SimpleNamespace(returncode=0, stdout=f"{sha}\n"),
+            ) as run,
+        ):
+            resolved = _github_full_ref(
+                "https://github.com/deepseek-ai/DeepEP", "73b6ea4"
+            )
+
+        self.assertEqual(resolved, sha)
+        self.assertEqual(run.call_args.args[0][:2], ["gh", "api"])
 
 
 class ExactGitRefIntegrationTest(unittest.TestCase):
