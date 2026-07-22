@@ -1,0 +1,4 @@
+interface:
+  display_name: "vLLM Python Environment"
+  short_description: "Initialize vLLM Python environments on demand"
+  default_prompt: "Use $vllm-python-env before running Python in this vLLM checkout."
