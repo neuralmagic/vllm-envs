@@ -1,10 +1,11 @@
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import call, patch
 
-from vllm_envs.layers import _install_flashinfer_jit_cache
+from vllm_envs.layers import _install_flashinfer_jit_cache, _install_req_groups
 
 
 class FlashInferJitCacheTest(unittest.TestCase):
@@ -56,6 +57,70 @@ class FlashInferJitCacheTest(unittest.TestCase):
                 "https://flashinfer.ai/whl/cu130",
             ],
         )
+
+
+class InstallReqGroupsTest(unittest.TestCase):
+    def setUp(self):
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.venv = root / ".venv"
+        self.cap = root / "constraints.txt"
+        self.test_files = [root / "test-cuda.txt"]
+        self.runtime_files = [root / "cuda.txt"]
+        self.groups = [self.test_files, self.runtime_files]
+
+    def test_resolves_all_groups_in_one_pass(self):
+        with patch("vllm_envs.layers._install_reqs") as install:
+            _install_req_groups(
+                "cfg", "keys", self.venv, self.groups, "cuda", self.cap
+            )
+
+        install.assert_called_once_with(
+            "cfg", "keys", self.venv,
+            [*self.test_files, *self.runtime_files], "cuda", self.cap,
+        )
+
+    def test_falls_back_to_one_pass_per_group(self):
+        # A stale test lock (cuda-pathfinder==1.3.3) against a runtime pin that
+        # needs a newer one: unsatisfiable together, fine in separate passes.
+        passes = []
+
+        def install(cfg, keys, venv, files, platform, cap_dest):
+            passes.append(list(files))
+            if len(passes) == 1:  # the combined resolve
+                raise subprocess.CalledProcessError(1, ["uv"])
+
+        with patch("vllm_envs.layers._install_reqs", side_effect=install):
+            _install_req_groups(
+                "cfg", "keys", self.venv, self.groups, "cuda", self.cap
+            )
+
+        self.assertEqual(
+            passes,
+            [
+                [*self.test_files, *self.runtime_files],
+                self.test_files,
+                self.runtime_files,
+            ],
+        )
+
+    def test_single_group_failure_propagates(self):
+        with patch(
+            "vllm_envs.layers._install_reqs",
+            side_effect=subprocess.CalledProcessError(1, ["uv"]),
+        ) as install:
+            with self.assertRaises(subprocess.CalledProcessError):
+                _install_req_groups(
+                    "cfg", "keys", self.venv, [self.runtime_files, []],
+                    "cuda", self.cap,
+                )
+
+        install.assert_called_once()
+
+    def test_no_requirement_files_is_a_noop(self):
+        with patch("vllm_envs.layers._install_reqs") as install:
+            _install_req_groups("cfg", "keys", self.venv, [[], []], "cuda", self.cap)
+
+        install.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -196,6 +196,36 @@ def _install_reqs(
         return
 
 
+def _install_req_groups(
+    cfg: Config, keys: VenvKeys, venv: Path, groups: list[list[Path]],
+    platform: str, cap_dest: Path,
+) -> None:
+    """Install requirement groups in one resolve, falling back to one pass per
+    group when their pins cannot hold simultaneously.
+
+    vLLM's compiled test lock (requirements/test/<platform>.txt) periodically
+    goes stale against requirements/<platform>.txt — e.g. the lock pinning
+    cuda-pathfinder==1.3.3 while the pinned flashinfer-python needs >=1.5.4.
+    Resolving every file at once is stricter than vLLM itself: upstream installs
+    those files in separate passes, so such pairs never have to agree.  Mirror
+    that rather than failing the layer; groups are installed in order, so the
+    last group's pins win wherever they overlap."""
+    files = [f for group in groups for f in group]
+    if not files:
+        return
+    try:
+        _install_reqs(cfg, keys, venv, files, platform, cap_dest)
+        return
+    except subprocess.CalledProcessError:
+        groups = [group for group in groups if group]
+        if len(groups) < 2:
+            raise
+        warn("requirement files cannot be resolved together → installing them "
+             "in separate passes (later files win where they overlap)")
+    for group in groups:
+        _install_reqs(cfg, keys, venv, group, platform, cap_dest)
+
+
 def _venv_freeze(venv: Path) -> list[str]:
     out = run(["uv", "pip", "freeze", "--python", str(venv / "bin" / "python")]).stdout
     return sorted(line.strip() for line in out.splitlines() if line.strip())
@@ -259,10 +289,12 @@ def ensure_full_template(cfg: Config, keys: VenvKeys, platform: str) -> Path:
         reflink_clone(base, entry)
         _rewrite_venv_paths(base, entry)
         (entry / ".complete").unlink(missing_ok=True)
-        requirement_files = [*keys.layout.runtime_files, *keys.layout.test_files]
-        if requirement_files:
-            _install_reqs(cfg, keys, entry, requirement_files, platform,
-                          entry / "constraints.txt")
+        # Test lock first so the runtime pins win if they have to be split.
+        _install_req_groups(
+            cfg, keys, entry,
+            [keys.layout.test_files, keys.layout.runtime_files],
+            platform, entry / "constraints.txt",
+        )
         (entry / "freeze.txt").write_text("\n".join(_venv_freeze(entry)) + "\n")
         (entry / ".complete").touch()
         write_meta(entry, {"kind": "venv-full", "hash": keys.full_hash, "base": keys.base_hash})
@@ -290,13 +322,11 @@ def resolve_venv(cfg: Config, env_root: Path, fresh: bool = False) -> tuple[Path
             say(f"venv layer: requirements changed → top-up install into env venv "
                 f"({current} → {keys.full_hash})")
             template = ensure_full_template(cfg, keys, platform)
-            requirement_files = [
-                *keys.layout.runtime_files,
-                *keys.layout.test_files,
-            ]
-            if requirement_files:
-                _install_reqs(cfg, keys, venv, requirement_files, platform,
-                              _scratch(env_root) / "constraints.txt")
+            _install_req_groups(
+                cfg, keys, venv,
+                [keys.layout.test_files, keys.layout.runtime_files],
+                platform, _scratch(env_root) / "constraints.txt",
+            )
             _uninstall_removed_deps(env_root, venv, template)
             update_marker(env_root, venv_full_hash=keys.full_hash, venv_base_hash=keys.base_hash)
             return venv, keys
