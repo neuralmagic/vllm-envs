@@ -73,6 +73,34 @@ class LocalBuildCacheIntegrationTest(unittest.TestCase):
         self.assertEqual(second.mode, "store-wheel")
         self.assertEqual(second.wheel, first.wheel)
 
+    def test_local_wheel_is_published_atomically(self):
+        venv = self.make_venv(self.repo)
+        entry = self.cfg.store("builds") / "build-key"
+        target = entry / "vllm-1.0-cp312-cp312-linux_x86_64.whl"
+        real_copy2 = shutil.copy2
+
+        def fake_build(cfg, env_root, venv, build_temp, dist_dir, use_pinned_ext):
+            dist_dir.mkdir(parents=True)
+            wheel = dist_dir / target.name
+            wheel.write_bytes(b"compiled wheel")
+            return wheel
+
+        def observe_copy(source, destination):
+            self.assertNotEqual(Path(destination), target)
+            self.assertFalse(target.exists())
+            return real_copy2(source, destination)
+
+        with (
+            patch("vllm_envs.layers.build_key", return_value="build-key"),
+            patch("vllm_envs.layers.try_fetch_precompiled", return_value=None),
+            patch("vllm_envs.layers._build_wheel", side_effect=fake_build),
+            patch("vllm_envs.layers.shutil.copy2", side_effect=observe_copy),
+        ):
+            result = resolve_build(self.cfg, self.repo, venv)
+
+        self.assertEqual(result.wheel, target)
+        self.assertEqual(target.read_bytes(), b"compiled wheel")
+
     def test_torch_and_build_flags_separate_local_binary_keys(self):
         venv = self.make_venv(self.repo)
         original = build_key(self.repo, "cpu", "3.12", venv)

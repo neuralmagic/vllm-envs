@@ -537,8 +537,10 @@ def resolve_build(cfg: Config, env_root: Path, venv: Path) -> BuildResolution:
                 return BuildResolution("precompiled-fetch", None, bhash, shared=False)
             entry.mkdir(parents=True, exist_ok=True)
             target = entry / built.name
-            shutil.copy2(built, target)
-            target.chmod(0o444)
+            tmp = target.with_name(target.name + f".tmp{os.getpid()}")
+            shutil.copy2(built, tmp)
+            tmp.chmod(0o444)
+            os.replace(tmp, target)
             write_meta(entry, {"kind": "build", "hash": bhash, "wheel": built.name})
             touch_last_used(entry)
             if build_temp.exists():
