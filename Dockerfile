@@ -28,7 +28,8 @@ ENV UV_PYTHON_INSTALL_DIR=/opt/uv-python \
     PATH=/root/.local/bin:${PATH}
 
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv python install --default ${PYTHON_VERSION}
+    uv python install --default ${PYTHON_VERSION} \
+    && ln -sf /root/.local/bin/python${PYTHON_VERSION} /usr/bin/python${PYTHON_VERSION}
 
 WORKDIR /opt/vllm-envs
 COPY pyproject.toml README.md ./
