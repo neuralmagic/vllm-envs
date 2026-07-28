@@ -19,6 +19,7 @@ RUN apt-get update \
         git \
         openssh-client \
         pkg-config \
+        zsh \
     && rm -rf /var/lib/apt/lists/*
 
 ENV UV_PYTHON_INSTALL_DIR=/opt/uv-python \
