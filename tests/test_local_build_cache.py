@@ -87,6 +87,22 @@ class LocalBuildCacheIntegrationTest(unittest.TestCase):
         self.assertNotEqual(original, changed_torch)
         self.assertNotEqual(changed_torch, changed_flags)
 
+    def test_worktree_venv_paths_do_not_separate_build_keys(self):
+        first_venv = self.make_venv(self.repo)
+        second_venv = self.make_venv(self.other)
+        for venv in (first_venv, second_venv):
+            bindir = venv / "bin"
+            bindir.mkdir()
+            for name in ("cmake", "ninja"):
+                tool = bindir / name
+                tool.write_text("#!/bin/sh\necho fake-tool 1.0\n")
+                tool.chmod(0o755)
+
+        self.assertEqual(
+            build_key(self.repo, "cpu", "3.12", first_venv),
+            build_key(self.other, "cpu", "3.12", second_venv),
+        )
+
     @unittest.skipUnless(shutil.which("ccache") and shutil.which("c++"),
                          "ccache and c++ are required")
     def test_ccache_hits_across_content_addressed_build_directories(self):
