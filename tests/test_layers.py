@@ -1,11 +1,13 @@
 import subprocess
 import tempfile
+import shutil
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import call, patch
 
 from vllm_envs.layers import _install_flashinfer_jit_cache, _install_req_groups
+from vllm_envs.layers import fixup_fa_cute_imports
 
 
 class FlashInferJitCacheTest(unittest.TestCase):
@@ -121,6 +123,61 @@ class InstallReqGroupsTest(unittest.TestCase):
             _install_req_groups("cfg", "keys", self.venv, [[], []], "cuda", self.cap)
 
         install.assert_not_called()
+
+
+class FixupFaCuteImportsTests(unittest.TestCase):
+    """A precompiled + editable attach copies vllm/vllm_flash_attn/cute/ without
+    running cmake's rewrite, and the runtime shim only covers the symlink case,
+    so ve has to apply the rewrite itself."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.env_root = Path(self.tmp.name)
+        self.cute = self.env_root / "vllm" / "vllm_flash_attn" / "cute"
+        self.cute.mkdir(parents=True)
+
+    def test_rewrites_bare_imports_in_a_copied_tree(self):
+        src = self.cute / "flash_fwd.py"
+        src.write_text("from flash_attn.cute import utils\nimport flash_attn.cute.pack\n")
+
+        fixup_fa_cute_imports(self.env_root)
+
+        self.assertEqual(
+            src.read_text(),
+            "from vllm.vllm_flash_attn.cute import utils\n"
+            "import vllm.vllm_flash_attn.cute.pack\n",
+        )
+
+    def test_is_idempotent(self):
+        src = self.cute / "flash_fwd.py"
+        src.write_text("from flash_attn.cute import utils\n")
+
+        fixup_fa_cute_imports(self.env_root)
+        once = src.read_text()
+        fixup_fa_cute_imports(self.env_root)
+
+        self.assertEqual(src.read_text(), once)
+
+    def test_leaves_a_symlinked_tree_alone(self):
+        # VLLM_FLASH_ATTN_SRC_DIR builds symlink cute/ and rely on the runtime
+        # shim to register a virtual flash_attn package; rewriting the source
+        # checkout in place would be wrong.
+        real = self.env_root / "fa-src" / "cute"
+        real.mkdir(parents=True)
+        (real / "flash_fwd.py").write_text("from flash_attn.cute import utils\n")
+        shutil.rmtree(self.cute)
+        self.cute.symlink_to(real, target_is_directory=True)
+
+        fixup_fa_cute_imports(self.env_root)
+
+        self.assertEqual(
+            (real / "flash_fwd.py").read_text(), "from flash_attn.cute import utils\n"
+        )
+
+    def test_missing_tree_is_a_noop(self):
+        shutil.rmtree(self.cute)
+        fixup_fa_cute_imports(self.env_root)  # must not raise
 
 
 if __name__ == "__main__":
