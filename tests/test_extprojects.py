@@ -92,6 +92,31 @@ class ExactGitRefIntegrationTest(unittest.TestCase):
             self.git(origin, "rev-parse", "archived"),
         )
 
+    def test_fetches_short_commit_from_default_branch_without_api(self):
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        origin = root / "origin"
+        checkout = root / "checkout"
+        origin.mkdir()
+        self.git(origin, "init", "-b", "main")
+        self.git(origin, "config", "user.name", "Test User")
+        self.git(origin, "config", "user.email", "test@example.com")
+        (origin / "data").write_text("pinned\n")
+        self.git(origin, "add", "data")
+        self.git(origin, "commit", "-m", "pinned")
+        pinned = self.git(origin, "rev-parse", "HEAD")
+        for index in range(3):
+            (origin / "data").write_text(f"head-{index}\n")
+            self.git(origin, "commit", "-am", f"head {index}")
+
+        with patch(
+            "vllm_envs.extprojects._github_full_ref",
+            side_effect=AssertionError("hosting API must not be used"),
+        ):
+            fetch_ref(str(origin), pinned[:10], checkout, "test")
+
+        self.assertEqual((checkout / "data").read_text(), "pinned\n")
+        self.assertEqual(self.git(checkout, "rev-parse", "HEAD"), pinned)
+
 
 if __name__ == "__main__":
     unittest.main()

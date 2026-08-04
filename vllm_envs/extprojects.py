@@ -153,6 +153,35 @@ def _github_full_ref(repo: str, ref: str) -> str | None:
     return sha if re.fullmatch(r"[0-9a-fA-F]{40}", sha) else None
 
 
+def _fetch_short_ref_from_default_branch(dest: Path, ref: str) -> bool:
+    """Resolve a short commit from bounded default-branch history.
+
+    Git servers generally do not advertise short object IDs as fetchable refs.
+    Fetching a small amount of default-branch history handles the common case
+    without relying on a hosting-provider API or cloning the full repository.
+    """
+    if not re.fullmatch(r"[0-9a-fA-F]{7,39}", ref):
+        return False
+    for depth in (64, 256, 1024):
+        fetch = run(
+            ["git", "fetch", f"--depth={depth}", "origin", "HEAD"],
+            cwd=dest,
+            env=FOREIGN_GIT_ENV,
+            check=False,
+        )
+        if fetch.returncode != 0:
+            return False
+        resolved = run(
+            ["git", "rev-parse", "--verify", f"{ref}^{{commit}}"],
+            cwd=dest,
+            env=FOREIGN_GIT_ENV,
+            check=False,
+        )
+        if resolved.returncode == 0:
+            return True
+    return False
+
+
 def fetch_ref(repo: str, ref: str, dest: Path, label: str) -> None:
     """Create a checkout by fetching only the requested tag/commit."""
     if dest.exists():
@@ -170,18 +199,22 @@ def fetch_ref(repo: str, ref: str, dest: Path, label: str) -> None:
         env=FOREIGN_GIT_ENV,
         check=False,
     )
+    checkout_ref = "FETCH_HEAD"
     if fetch.returncode != 0:
-        expanded = _github_full_ref(repo, ref)
-        if expanded is None:
-            raise RuntimeError(f"cannot fetch {repo} at {ref}")
-        run(
-            ["git", "fetch", "--depth=1", "origin", expanded],
-            cwd=dest,
-            env=FOREIGN_GIT_ENV,
-            stream_prefix=f"[ve]   [{label}] ",
-        )
+        if _fetch_short_ref_from_default_branch(dest, ref):
+            checkout_ref = ref
+        else:
+            expanded = _github_full_ref(repo, ref)
+            if expanded is None:
+                raise RuntimeError(f"cannot fetch {repo} at {ref}")
+            run(
+                ["git", "fetch", "--depth=1", "origin", expanded],
+                cwd=dest,
+                env=FOREIGN_GIT_ENV,
+                stream_prefix=f"[ve]   [{label}] ",
+            )
     run(
-        ["git", "checkout", "--quiet", "--detach", "FETCH_HEAD"],
+        ["git", "checkout", "--quiet", "--detach", checkout_ref],
         cwd=dest,
         env=FOREIGN_GIT_ENV,
     )
