@@ -674,6 +674,49 @@ def attach(cfg: Config, env_root: Path, venv: Path, res: BuildResolution) -> Non
 # --------------------------------------------------------------------------
 
 
+def fixup_fa_cute_imports(env_root: Path) -> None:
+    """Rewrite vendored FA4 CuteDSL imports the way a real build would.
+
+    ``vllm/vllm_flash_attn/cute/`` is a vendored copy of flash-attention's
+    CuteDSL tree whose sources import ``flash_attn.cute.*``. Upstream handles
+    that two ways (``cmake/external_projects/vllm_flash_attn.cmake``):
+
+      * ``VLLM_FLASH_ATTN_SRC_DIR`` set -- ``cute/`` becomes a symlink and
+        ``vllm_flash_attn``'s ``__init__`` registers a virtual ``flash_attn``
+        package at import time;
+      * otherwise -- the install component copies the files *and* rewrites
+        ``flash_attn.cute`` to ``vllm.vllm_flash_attn.cute``.
+
+    A precompiled + editable attach runs neither: no cmake install component,
+    and no symlink. The tree lands as a plain copy with unrewritten imports,
+    which the runtime shim does not cover because it is gated on the directory
+    being a symlink. Any FA4 CuteDSL path then dies with ``ModuleNotFoundError:
+    No module named 'flash_attn'``.
+
+    Apply the same rewrite here. Idempotent: already-rewritten files contain no
+    bare ``flash_attn.cute`` prefix, and a symlinked tree is left alone so the
+    runtime shim keeps owning that case.
+    """
+    cute = env_root / "vllm" / "vllm_flash_attn" / "cute"
+    if not cute.is_dir() or cute.is_symlink():
+        return
+    fixed = 0
+    for f in cute.rglob("*.py"):
+        try:
+            text = f.read_text()
+        except (OSError, UnicodeDecodeError):
+            continue
+        # Only bare occurrences; skip text already carrying the vllm prefix.
+        new = re.sub(
+            r"(?<!vllm\.vllm_)flash_attn\.cute", "vllm.vllm_flash_attn.cute", text
+        )
+        if new != text:
+            f.write_text(new)
+            fixed += 1
+    if fixed:
+        say(f"fa4-cute: rewrote vendored imports in {fixed} file(s)")
+
+
 def sync(cfg: Config, env_root: Path, fresh_venv: bool = False) -> None:
     if os.environ.get("VE_NO_SYNC") == "1":
         warn("VE_NO_SYNC=1 — env is STALE; run `ve sync` when ready")
@@ -682,6 +725,7 @@ def sync(cfg: Config, env_root: Path, fresh_venv: bool = False) -> None:
     venv, keys = resolve_venv(cfg, env_root, fresh=fresh_venv)
     res = resolve_build(cfg, env_root, venv)
     attach(cfg, env_root, venv, res)
+    fixup_fa_cute_imports(env_root)
     platform = cfg.platform or detect_platform()
     if cfg.with_vllm_extras and platform == "cuda":
         sync_vllm_extras(cfg, env_root, venv, keys.full_hash)
