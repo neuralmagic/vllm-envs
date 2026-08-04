@@ -41,7 +41,7 @@ class Config:
     platform: str = ""  # auto-detect when empty
     cap: str = "minor"  # cap unpinned requirement floors: minor | major | none
     with_test: bool = True  # install & cache requirements/test/<platform>.txt
-    with_deepep: bool = True  # install DeepEP in every CUDA environment
+    with_vllm_extras: bool = True  # install vLLM's optional runtime bundle
     raw: dict = field(default_factory=dict)
 
     @property
@@ -72,7 +72,9 @@ def load_config() -> Config:
         venv = data.get("venv", {})
         cfg.cap = str(venv.get("cap", cfg.cap))
         cfg.with_test = bool(venv.get("test", cfg.with_test))
-        cfg.with_deepep = bool(venv.get("deepep", cfg.with_deepep))
+        cfg.with_vllm_extras = bool(
+            venv.get("vllm_extras", venv.get("deepep", cfg.with_vllm_extras))
+        )
     if v := os.environ.get("VE_MAX_SIZE_GB"):
         cfg.max_size_gb = float(v)
     if v := os.environ.get("VE_ENVS_ROOT"):
@@ -81,8 +83,13 @@ def load_config() -> Config:
         cfg.cap = v
     if v := os.environ.get("VE_WITH_TEST"):
         cfg.with_test = v.strip().lower() not in ("0", "false", "no", "off")
-    if v := os.environ.get("VE_WITH_DEEPEP"):
-        cfg.with_deepep = v.strip().lower() not in ("0", "false", "no", "off")
+    if v := os.environ.get("VE_WITH_VLLM_EXTRAS") or os.environ.get("VE_WITH_DEEPEP"):
+        cfg.with_vllm_extras = v.strip().lower() not in (
+            "0",
+            "false",
+            "no",
+            "off",
+        )
     if cfg.cap not in ("minor", "major", "none"):
         raise SystemExit(f"[ve] invalid cap mode {cfg.cap!r} (minor|major|none)")
     return cfg

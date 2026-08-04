@@ -11,8 +11,8 @@ from pathlib import Path
 
 from . import editable
 from .config import SCRATCH_DIR_NAME, Config
-from .deepep import sync_deepep
 from .extprojects import src_dir_env, user_overrides
+from .extras import sync_vllm_extras
 from .hashing import (
     VenvKeys,
     build_key,
@@ -683,6 +683,6 @@ def sync(cfg: Config, env_root: Path, fresh_venv: bool = False) -> None:
     res = resolve_build(cfg, env_root, venv)
     attach(cfg, env_root, venv, res)
     platform = cfg.platform or detect_platform()
-    if cfg.with_deepep and platform == "cuda":
-        sync_deepep(cfg, env_root, venv, keys.full_hash)
+    if cfg.with_vllm_extras and platform == "cuda":
+        sync_vllm_extras(cfg, env_root, venv, keys.full_hash)
     say(f"env consistent at {head}")

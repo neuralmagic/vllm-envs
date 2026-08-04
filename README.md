@@ -92,7 +92,7 @@ An env is just a git worktree plus a private `.venv`, assembled from shared cont
 |---|---|---|
 | `venvs-base/` | torch + build deps | build requirements + torch pins + python/CUDA version |
 | `venvs/` | full deps (derived from `venvs-base`); test deps too when `[venv] test` is on | base key + runtime (+ test) requirements |
-| `ep-kernels/` | DeepEP wheel and its NVSHMEM runtime | vLLM installer + Docker pin + venv/CUDA inputs |
+| `ep-kernels/` | cached EP-kernel wheels and their NVSHMEM runtime | vLLM installer + Docker pin + venv/CUDA inputs |
 | `ext-src/` | pinned external sources (cutlass, flash-attn, ...) | project + pin parsed from the worktree's cmake files |
 | `builds/` | compiled-extension wheel + extracted-file mirror + editable-install replay | source + Python/Torch ABI + host/compiler/CUDA/GPU target + build flags |
 | `cmake-build/` | persistent cmake trees for incremental local builds | same hash as `builds/` |
@@ -120,11 +120,12 @@ flowchart LR
     cmake -. "local ccache build" .-> builds
 ```
 
-`ve sync` (run by `ve new`/`ve init` and the post-checkout hook) resolves three layers, skipping whatever is already consistent:
+`ve sync` (run by `ve new`/`ve init` and the post-checkout hook) resolves four layers, skipping whatever is already consistent:
 
 1. **venv** — requirements files are hashed; on a hit the env's `.venv` is reflink-cloned from the cached template (CoW: edit site-packages freely, other envs are unaffected). Templates are derived `venvs-base` → `venvs`, so a runtime-requirements change only re-installs the delta. On a commit hop the private venv is converged in place (top-up install + uninstall of dropped deps).
 2. **build** — csrc/cmake/setup.py content is hashed together with the effective Python/Torch ABI, host/compiler/CUDA toolchains, GPU target, and build flags. Clean-tree resolution order: store hit → exact-commit or compatible-main precompiled wheel from wheels.vllm.ai (published into the store) → local ccache build (also published), with `ext-src/` pins injected via `*_SRC_DIR` env vars and a persistent per-hash cmake tree for incremental rebuilds. Local builds disable sccache and set `CCACHE_NOHASHDIR=true`, allowing unchanged translation units to hit across content-addressed build directories. Dirty csrc/ or user `*_SRC_DIR` overrides → private builds, never published.
 3. **attach** — makes the worktree importable as an editable install: the wheel's `.so` files and bundled third-party py files are placed into the worktree as reflinks of the shared mirror in `builds/<hash>/extracted/` (~450MB physical shared per env), and the editable-install artifacts (`.pth`, finder, dist-info) are written into the venv. The first attach at a build hash runs vLLM's own setup.py once (historically correct extraction for old releases) and captures the result; later attaches at the same commit replay it with no setup.py run, and an already-attached env is a no-op.
+4. **vLLM extras** — installs vLLM's supported optional runtime bundle as one unit. The bundle uses the checkout's own EP-kernel and KV-connector installers, so compatible DeepEP, NVSHMEM, NIXL, Mooncake, and related components move together with the vLLM commit.
 
 Warm-cache timing: fresh `ve new`/`ve init` ~7s, no-op `ve sync` ~1s; a cold build costs one normal vLLM build, then every env at that hash shares it.
 
@@ -145,7 +146,7 @@ python = "3.12"
 cap = "minor"   # cap unpinned requirement floors: minor | major | none (VE_CAP overrides)
 test = true     # install & cache requirements/test/<platform>.txt into the full venv
                 #   (prefers the pinned .txt, falls back to .in); VE_WITH_TEST overrides
-deepep = true   # install DeepEP in every CUDA env; VE_WITH_DEEPEP overrides
+vllm_extras = true  # install the vLLM extras bundle; VE_WITH_VLLM_EXTRAS overrides
 ```
 
 With `test = true` (the default) the `venvs/` layer also installs vLLM's test
@@ -156,14 +157,13 @@ When a CUDA vLLM checkout requires `flashinfer-python`, `ve` also installs the
 matching `flashinfer-jit-cache` wheel from FlashInfer's CUDA-specific index.
 This derived dependency is required and has no opt-out.
 
-CUDA environments install DeepEP by default using vLLM's
-`tools/ep_kernels/install_python_libraries.sh`. The DeepEP commit follows
-`docker/versions.json`, falling back to the installer's own default, and the
-NVSHMEM version follows the installer default. Set `deepep = false` (or
-`VE_WITH_DEEPEP=0`) to opt out. Commits from before that installer was added
-are detected and skipped. CUDA architectures include the DeepEP Docker targets
-and locally detected GPU targets, unless `TORCH_CUDA_ARCH_LIST` is explicitly
-set.
+CUDA environments install the vLLM extras bundle by default using the
+checkout's `tools/ep_kernels/install_python_libraries.sh` and
+`.buildkite/scripts/install-kv-connectors.sh`. Pins and requirements therefore
+follow the selected vLLM commit. Set `vllm_extras = false` (or
+`VE_WITH_VLLM_EXTRAS=0`) to opt out. Unsupported components are skipped for
+older commits. CUDA architectures include the vLLM Docker targets and locally
+detected GPU targets unless `TORCH_CUDA_ARCH_LIST` is explicitly set.
 
 Env vars: `VE_CACHE_DIR`, `VE_NO_SYNC=1` (skip hook sync, warn instead).
 
@@ -175,7 +175,7 @@ The default suite is fast and replaces only external builds and installs:
 python -m unittest discover -s tests -v
 ```
 
-An opt-in E2E mode runs real `uv` installs, vLLM/CUDA compilation, DeepEP
+An opt-in E2E mode runs real `uv` installs, vLLM/CUDA compilation, vLLM extras
 build and import, Git hooks, worktree creation, a committed build-input edit,
 and checkout back to the original cached build:
 
