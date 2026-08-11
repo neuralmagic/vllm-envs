@@ -2,6 +2,7 @@ import os
 import shutil
 import subprocess
 import sys
+from collections import deque
 from pathlib import Path
 
 from .log import say
@@ -33,17 +34,22 @@ def run(
             text=True,
         )
         assert proc.stdout is not None
+        recent = deque(maxlen=200)
         try:
             for line in proc.stdout:
+                recent.append(line)
                 print(
                     f"{stream_prefix}{line.rstrip()}", file=sys.stderr, flush=True
                 )
         finally:
             proc.stdout.close()
         proc.wait()
+        output = "".join(recent)
         if check and proc.returncode != 0:
-            raise subprocess.CalledProcessError(proc.returncode, cmd)
-        return subprocess.CompletedProcess(cmd, proc.returncode, "", "")
+            raise subprocess.CalledProcessError(
+                proc.returncode, cmd, output=output
+            )
+        return subprocess.CompletedProcess(cmd, proc.returncode, output, "")
     return subprocess.run(
         cmd,
         cwd=str(cwd) if cwd else None,

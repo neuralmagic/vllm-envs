@@ -8,7 +8,14 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from vllm_envs.config import Config
-from vllm_envs.deepep import DeepEPResolution, _prepare_sources, resolve, sync_deepep
+from vllm_envs.deepep import (
+    DeepEPResolution,
+    _nccl_lib_dir,
+    _nccl_override,
+    _prepare_sources,
+    resolve,
+    sync_deepep,
+)
 from vllm_envs.registry import read_marker, write_marker
 from vllm_envs.store import read_meta
 
@@ -84,6 +91,34 @@ class DeepEPResolutionTest(unittest.TestCase):
 
         self.assertEqual(resolution.ref, "script-ref")
 
+    def test_uses_docker_nccl_pin(self):
+        root = self.make_root()
+        versions = root / "docker" / "versions.json"
+        versions.parent.mkdir()
+        versions.write_text(
+            json.dumps({"variable": {"NCCL_VERSION": {"default": "2.30.7"}}})
+        )
+
+        resolution = resolve(root, "venv-hash")
+
+        self.assertEqual(resolution.nccl_version, "2.30.7")
+
+    def test_nccl_pin_changes_layer_key(self):
+        root = self.make_root()
+        versions = root / "docker" / "versions.json"
+        versions.parent.mkdir()
+
+        versions.write_text(
+            json.dumps({"variable": {"NCCL_VERSION": {"default": "2.30.7"}}})
+        )
+        first = resolve(root, "venv-hash")
+        versions.write_text(
+            json.dumps({"variable": {"NCCL_VERSION": {"default": "2.31.0"}}})
+        )
+        second = resolve(root, "venv-hash")
+
+        self.assertNotEqual(first.key, second.key)
+
     def test_venv_hash_changes_layer_key(self):
         root = self.make_root()
 
@@ -91,6 +126,11 @@ class DeepEPResolutionTest(unittest.TestCase):
         second = resolve(root, "second")
 
         self.assertNotEqual(first.key, second.key)
+
+    def test_nccl_pin_is_absent_without_docker_versions(self):
+        root = self.make_root()
+
+        self.assertEqual(resolve(root, "venv-hash").nccl_version, "")
 
     def test_commit_before_ep_installer_is_skipped(self):
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))
@@ -197,6 +237,84 @@ class DeepEPLayerIntegrationTest(unittest.TestCase):
         self.assertNotEqual(first_hash, second_hash)
         self.assertTrue((cfg.store("ep-kernels") / second_hash / ".complete").exists())
         self.assertEqual((state["builds"], state["installs"]), (2, 2))
+
+
+class NcclOverrideTest(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.venv = self.root / ".venv"
+        self.dest = self.root / "entry" / "nccl-override.txt"
+        self.resolution = DeepEPResolution(
+            key="key",
+            ref="ref",
+            nvshmem_version="3.3.24",
+            cuda_arch_list="",
+            installer=self.root / "installer.sh",
+            nccl_version="2.30.7",
+        )
+
+    def test_writes_override_pinning_the_docker_nccl(self):
+        with patch(
+            "vllm_envs.deepep.run",
+            return_value=SimpleNamespace(returncode=0, stdout="Version: 2.29.7\n"),
+        ):
+            override = _nccl_override(self.venv, self.resolution, self.dest)
+
+        self.assertEqual(override, str(self.dest))
+        self.assertEqual(self.dest.read_text(), "nvidia-nccl-cu13==2.30.7\n")
+
+    def test_writes_override_even_when_already_installed(self):
+        # torch's exact pin can still pull it back down mid-install.
+        with patch(
+            "vllm_envs.deepep.run",
+            return_value=SimpleNamespace(returncode=0, stdout="Version: 2.30.7\n"),
+        ):
+            override = _nccl_override(self.venv, self.resolution, self.dest)
+
+        self.assertEqual(override, str(self.dest))
+
+    def test_no_override_without_an_nccl_wheel_in_the_venv(self):
+        with patch(
+            "vllm_envs.deepep.run",
+            return_value=SimpleNamespace(returncode=1, stdout=""),
+        ):
+            self.assertIsNone(_nccl_override(self.venv, self.resolution, self.dest))
+
+        self.assertFalse(self.dest.exists())
+
+    def test_nccl_lib_dir_comes_from_the_venv_wheel(self):
+        lib = self.root / "site-packages" / "nvidia" / "nccl" / "lib"
+        lib.mkdir(parents=True)
+
+        with patch(
+            "vllm_envs.deepep.run",
+            return_value=SimpleNamespace(returncode=0, stdout=f"{lib}\n"),
+        ):
+            self.assertEqual(_nccl_lib_dir(self.venv), str(lib))
+
+    def test_nccl_lib_dir_empty_when_wheel_is_absent(self):
+        with patch(
+            "vllm_envs.deepep.run",
+            return_value=SimpleNamespace(returncode=0, stdout="\n"),
+        ):
+            self.assertEqual(_nccl_lib_dir(self.venv), "")
+
+    def test_no_override_without_a_docker_pin(self):
+        with patch("vllm_envs.deepep.run") as run_mock:
+            override = _nccl_override(
+                self.venv,
+                DeepEPResolution(
+                    key="key",
+                    ref="ref",
+                    nvshmem_version="3.3.24",
+                    cuda_arch_list="",
+                    installer=self.resolution.installer,
+                ),
+                self.dest,
+            )
+
+        self.assertIsNone(override)
+        run_mock.assert_not_called()
 
 
 if __name__ == "__main__":

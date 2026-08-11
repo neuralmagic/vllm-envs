@@ -288,8 +288,30 @@ def cmd_status(cfg: Config, args) -> int:
     def state(current: str | None, wanted: str) -> str:
         return "OK" if current == wanted else f"STALE (have {current or 'none'})"
 
-    print(f"venv base:  {keys.base_hash}  {state(m.get('venv_base_hash'), keys.base_hash)}")
-    print(f"venv full:  {keys.full_hash}  {state(m.get('venv_full_hash'), keys.full_hash)}")
+    local_venv = root / ".venv"
+    local_state = state(m.get("venv_full_hash"), keys.full_hash)
+    if not local_venv.is_dir():
+        local_state = "MISSING (run `ve sync`)"
+    print(f"local venv: {local_state}")
+
+    def template_state(store: str, key: str) -> str:
+        entry = cfg.store(store) / key
+        if (entry / ".complete").exists():
+            return "HIT"
+        if entry.is_dir():
+            meta = read_meta(entry)
+            detail = meta.get("stage") or "previous construction did not finish"
+            return f"INCOMPLETE ({detail})"
+        return "MISS"
+
+    print(
+        f"venv base:  {keys.base_hash}  "
+        f"{template_state('venvs-base', keys.base_hash)}"
+    )
+    print(
+        f"venv full:  {keys.full_hash}  "
+        f"{template_state('venvs', keys.full_hash)}"
+    )
     if cfg.with_test and keys.layout.test_files:
         rel = keys.layout.test_files[0].relative_to(root)
         print(f"test deps:  included ({rel})")
