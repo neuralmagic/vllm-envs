@@ -19,7 +19,12 @@ RUN apt-get update \
         cmake \
         curl \
         git \
+        libgl1 \
+        libglib2.0-0 \
         libibverbs-dev \
+        libsm6 \
+        libxcb1 \
+        libxext6 \
         ninja-build \
         openssh-client \
         pkg-config \
