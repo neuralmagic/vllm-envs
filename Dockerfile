@@ -16,7 +16,11 @@ RUN apt-get update \
         build-essential \
         ca-certificates \
         ccache \
+        cmake \
+        curl \
         git \
+        libibverbs-dev \
+        ninja-build \
         openssh-client \
         pkg-config \
         zsh \
