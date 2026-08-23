@@ -4,15 +4,18 @@ import os
 import re
 import shutil
 import subprocess
+import sys
+import tempfile
 import time
 import zipfile
+from contextlib import contextmanager, redirect_stderr
 from dataclasses import dataclass
 from pathlib import Path
 
 from . import editable
 from .config import SCRATCH_DIR_NAME, Config
-from .deepep import sync_deepep
 from .extprojects import src_dir_env, user_overrides
+from .extras import sync_vllm_extras
 from .hashing import (
     VenvKeys,
     build_key,
@@ -26,7 +29,7 @@ from .locks import entry_lock
 from .log import say, warn
 from .precompiled import try_fetch_precompiled
 from .registry import read_marker, update_marker
-from .store import touch_last_used, write_meta
+from .store import read_meta, touch_last_used, write_meta
 from .util import human_size, reflink_clone, run
 
 
@@ -50,11 +53,25 @@ def _rewrite_venv_paths(old: Path, new: Path) -> None:
 
 
 def _uv_pip(venv: Path, args: list[str], env: dict | None = None) -> None:
-    run(
-        ["uv", "pip", "install", "--python", str(venv / "bin" / "python"), *args],
-        env=env,
-        stream_prefix="[ve]   [uv] ",
-    )
+    delays = (5, 15, 30)
+    for attempt in range(len(delays) + 1):
+        try:
+            run(
+                ["uv", "pip", "install", "--python",
+                 str(venv / "bin" / "python"), *args],
+                env=env,
+                stream_prefix="[ve]   [uv] ",
+            )
+            return
+        except subprocess.CalledProcessError as exc:
+            if "429 Too Many Requests" not in (exc.output or "") or attempt == len(delays):
+                raise
+            delay = delays[attempt]
+            warn(
+                f"package index rate-limited the install; retrying in "
+                f"{delay}s ({attempt + 1}/{len(delays)})"
+            )
+            time.sleep(delay)
 
 
 _CAP_FALLBACK = {"minor": "major", "major": "none"}
@@ -128,6 +145,7 @@ def _install_flashinfer_jit_cache(
         venv,
         [
             f"flashinfer-jit-cache=={version}",
+            "--no-deps",
             "--index-url",
             f"https://flashinfer.ai/whl/cu{cuda_variant}",
         ],
@@ -196,6 +214,36 @@ def _install_reqs(
         return
 
 
+def _install_req_groups(
+    cfg: Config, keys: VenvKeys, venv: Path, groups: list[list[Path]],
+    platform: str, cap_dest: Path,
+) -> None:
+    """Install requirement groups in one resolve, falling back to one pass per
+    group when their pins cannot hold simultaneously.
+
+    vLLM's compiled test lock (requirements/test/<platform>.txt) periodically
+    goes stale against requirements/<platform>.txt — e.g. the lock pinning
+    cuda-pathfinder==1.3.3 while the pinned flashinfer-python needs >=1.5.4.
+    Resolving every file at once is stricter than vLLM itself: upstream installs
+    those files in separate passes, so such pairs never have to agree.  Mirror
+    that rather than failing the layer; groups are installed in order, so the
+    last group's pins win wherever they overlap."""
+    files = [f for group in groups for f in group]
+    if not files:
+        return
+    try:
+        _install_reqs(cfg, keys, venv, files, platform, cap_dest)
+        return
+    except subprocess.CalledProcessError:
+        groups = [group for group in groups if group]
+        if len(groups) < 2:
+            raise
+        warn("requirement files cannot be resolved together → installing them "
+             "in separate passes (later files win where they overlap)")
+    for group in groups:
+        _install_reqs(cfg, keys, venv, group, platform, cap_dest)
+
+
 def _venv_freeze(venv: Path) -> list[str]:
     out = run(["uv", "pip", "freeze", "--python", str(venv / "bin" / "python")]).stdout
     return sorted(line.strip() for line in out.splitlines() if line.strip())
@@ -253,19 +301,64 @@ def ensure_full_template(cfg: Config, keys: VenvKeys, platform: str) -> Path:
             touch_last_used(entry)
             return entry
         base = ensure_base_template(cfg, keys, platform)
-        say(f"venv full layer: cache MISS ({keys.full_hash}) — deriving from base")
-        if entry.exists():
-            shutil.rmtree(entry)
-        reflink_clone(base, entry)
-        _rewrite_venv_paths(base, entry)
-        (entry / ".complete").unlink(missing_ok=True)
-        requirement_files = [*keys.layout.runtime_files, *keys.layout.test_files]
-        if requirement_files:
-            _install_reqs(cfg, keys, entry, requirement_files, platform,
-                          entry / "constraints.txt")
-        (entry / "freeze.txt").write_text("\n".join(_venv_freeze(entry)) + "\n")
+        meta = read_meta(entry)
+        resumable = (
+            entry.is_dir()
+            and (entry / "bin" / "python").exists()
+            and meta.get("kind") == "venv-full"
+            and meta.get("hash") == keys.full_hash
+            and meta.get("base") == keys.base_hash
+        )
+        if resumable:
+            say(
+                f"venv full layer: cache INCOMPLETE ({keys.full_hash}) — "
+                f"resuming {meta.get('stage', 'dependency install')}"
+            )
+        else:
+            say(
+                f"venv full layer: cache MISS ({keys.full_hash}) — "
+                "deriving from base"
+            )
+            if entry.exists():
+                shutil.rmtree(entry)
+            reflink_clone(base, entry)
+            _rewrite_venv_paths(base, entry)
+            (entry / ".complete").unlink(missing_ok=True)
+        attempt = {
+            "kind": "venv-full",
+            "hash": keys.full_hash,
+            "base": keys.base_hash,
+            "state": "building",
+            "stage": "installing test/runtime dependencies",
+            "size_bytes": meta.get("size_bytes", 0),
+        }
+        write_meta(entry, attempt)
+        try:
+            # Test lock first so runtime pins win if they must be split.
+            _install_req_groups(
+                cfg, keys, entry,
+                [keys.layout.test_files, keys.layout.runtime_files],
+                platform, entry / "constraints.txt",
+            )
+            attempt["stage"] = "recording installed packages"
+            write_meta(entry, attempt)
+            (entry / "freeze.txt").write_text(
+                "\n".join(_venv_freeze(entry)) + "\n"
+            )
+        except BaseException as exc:
+            attempt.update(
+                state="incomplete",
+                error=type(exc).__name__,
+                failed_at=time.time(),
+            )
+            write_meta(entry, attempt)
+            raise
         (entry / ".complete").touch()
-        write_meta(entry, {"kind": "venv-full", "hash": keys.full_hash, "base": keys.base_hash})
+        write_meta(
+            entry,
+            {"kind": "venv-full", "hash": keys.full_hash,
+             "base": keys.base_hash, "state": "complete"},
+        )
         touch_last_used(entry)
     return entry
 
@@ -290,13 +383,11 @@ def resolve_venv(cfg: Config, env_root: Path, fresh: bool = False) -> tuple[Path
             say(f"venv layer: requirements changed → top-up install into env venv "
                 f"({current} → {keys.full_hash})")
             template = ensure_full_template(cfg, keys, platform)
-            requirement_files = [
-                *keys.layout.runtime_files,
-                *keys.layout.test_files,
-            ]
-            if requirement_files:
-                _install_reqs(cfg, keys, venv, requirement_files, platform,
-                              _scratch(env_root) / "constraints.txt")
+            _install_req_groups(
+                cfg, keys, venv,
+                [keys.layout.test_files, keys.layout.runtime_files],
+                platform, _scratch(env_root) / "constraints.txt",
+            )
             _uninstall_removed_deps(env_root, venv, template)
             update_marker(env_root, venv_full_hash=keys.full_hash, venv_base_hash=keys.base_hash)
             return venv, keys
@@ -507,8 +598,10 @@ def resolve_build(cfg: Config, env_root: Path, venv: Path) -> BuildResolution:
                 return BuildResolution("precompiled-fetch", None, bhash, shared=False)
             entry.mkdir(parents=True, exist_ok=True)
             target = entry / built.name
-            shutil.copy2(built, target)
-            target.chmod(0o444)
+            tmp = target.with_name(target.name + f".tmp{os.getpid()}")
+            shutil.copy2(built, tmp)
+            tmp.chmod(0o444)
+            os.replace(tmp, target)
             write_meta(entry, {"kind": "build", "hash": bhash, "wheel": built.name})
             touch_last_used(entry)
             if build_temp.exists():
@@ -642,15 +735,58 @@ def attach(cfg: Config, env_root: Path, venv: Path, res: BuildResolution) -> Non
 # --------------------------------------------------------------------------
 
 
+class _Tee:
+    def __init__(self, *streams):
+        self.streams = streams
+
+    def write(self, data: str) -> int:
+        for stream in self.streams:
+            stream.write(data)
+        return len(data)
+
+    def flush(self) -> None:
+        for stream in self.streams:
+            stream.flush()
+
+
+@contextmanager
+def _failure_only_sync_log(env_root: Path):
+    scratch = _scratch(env_root)
+    failed = scratch / "last-sync-failure.log"
+    original_stderr = sys.stderr
+    with tempfile.NamedTemporaryFile(
+        mode="w", dir=scratch, prefix=".sync.", suffix=".pending", delete=False
+    ) as log, redirect_stderr(_Tee(original_stderr, log)):
+        pending = Path(log.name)
+        try:
+            yield
+        except BaseException:
+            log.flush()
+            pending.replace(failed)
+            print(
+                f"[ve] failure log retained at {failed}",
+                file=original_stderr,
+                flush=True,
+            )
+            raise
+        else:
+            pending.unlink(missing_ok=True)
+            failed.unlink(missing_ok=True)
+
+
 def sync(cfg: Config, env_root: Path, fresh_venv: bool = False) -> None:
     if os.environ.get("VE_NO_SYNC") == "1":
         warn("VE_NO_SYNC=1 — env is STALE; run `ve sync` when ready")
         return
-    head = run(["git", "rev-parse", "--short", "HEAD"], cwd=env_root).stdout.strip()
-    venv, keys = resolve_venv(cfg, env_root, fresh=fresh_venv)
-    res = resolve_build(cfg, env_root, venv)
-    attach(cfg, env_root, venv, res)
-    platform = cfg.platform or detect_platform()
-    if cfg.with_deepep and platform == "cuda":
-        sync_deepep(cfg, env_root, venv, keys.full_hash)
-    say(f"env consistent at {head}")
+    with entry_lock(_scratch(env_root) / "sync"):
+        with _failure_only_sync_log(env_root):
+            head = run(
+                ["git", "rev-parse", "--short", "HEAD"], cwd=env_root
+            ).stdout.strip()
+            venv, keys = resolve_venv(cfg, env_root, fresh=fresh_venv)
+            res = resolve_build(cfg, env_root, venv)
+            attach(cfg, env_root, venv, res)
+            platform = cfg.platform or detect_platform()
+            if cfg.with_vllm_extras and platform == "cuda":
+                sync_vllm_extras(cfg, env_root, venv, keys.full_hash)
+            say(f"env consistent at {head}")

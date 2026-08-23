@@ -25,6 +25,7 @@ class DeepEPResolution:
     nvshmem_version: str
     cuda_arch_list: str
     installer: Path
+    nccl_version: str = ""
 
 
 def _shell_default(script: str, name: str) -> str:
@@ -35,12 +36,10 @@ def _shell_default(script: str, name: str) -> str:
     return match.group(1)
 
 
-def _docker_deepep_ref(root: Path) -> str | None:
+def _docker_variable(root: Path, name: str) -> str | None:
     versions = root / "docker" / "versions.json"
     try:
-        value = json.loads(versions.read_text())["variable"]["DEEPEP_COMMIT_HASH"][
-            "default"
-        ]
+        value = json.loads(versions.read_text())["variable"][name]["default"]
     except (OSError, KeyError, TypeError, json.JSONDecodeError):
         return None
     return str(value)
@@ -77,14 +76,19 @@ def resolve(root: Path, venv_hash: str) -> DeepEPResolution:
     if not installer.is_file():
         raise RuntimeError(f"vLLM checkout has no EP installer: {installer}")
     script = installer.read_text()
-    ref = _docker_deepep_ref(root) or _shell_default(script, "DEEPEP_COMMIT_HASH")
+    ref = (
+        _docker_variable(root, "DEEPEP_COMMIT_HASH")
+        or _shell_default(script, "DEEPEP_COMMIT_HASH")
+    )
     nvshmem = _shell_default(script, "NVSHMEM_VER")
+    nccl = _docker_variable(root, "NCCL_VERSION") or ""
     archs = _cuda_arch_list(root)
     payload = json.dumps(
         {
             "installer": hashlib.sha256(installer.read_bytes()).hexdigest(),
             "ref": ref,
             "nvshmem": nvshmem,
+            "nccl": nccl,
             "venv": venv_hash,
             "cuda": cuda_version(),
             "archs": archs,
@@ -92,7 +96,7 @@ def resolve(root: Path, venv_hash: str) -> DeepEPResolution:
         sort_keys=True,
     )
     key = hashlib.sha256(payload.encode()).hexdigest()[:12]
-    return DeepEPResolution(key, ref, nvshmem, archs, installer)
+    return DeepEPResolution(key, ref, nvshmem, archs, installer, nccl)
 
 
 def _wheels(entry: Path) -> list[Path]:
@@ -151,6 +155,12 @@ def _ensure_wheels(
         build_env = {"VIRTUAL_ENV": str(venv)}
         if resolution.cuda_arch_list:
             build_env["TORCH_CUDA_ARCH_LIST"] = resolution.cuda_arch_list
+        if override := _nccl_override(venv, resolution, entry / "nccl-override.txt"):
+            build_env["UV_OVERRIDE"] = override
+        if nccl_lib := _nccl_lib_dir(venv):
+            for var in ("LIBRARY_PATH", "LD_LIBRARY_PATH"):
+                current = os.environ.get(var, "")
+                build_env[var] = f"{nccl_lib}:{current}" if current else nccl_lib
         run(
             [
                 "bash",
@@ -184,6 +194,58 @@ def _ensure_wheels(
         )
         touch_last_used(entry)
         return wheels
+
+
+_NCCL_LIB_DIR_SNIPPET = (
+    "import importlib.util as u, pathlib;"
+    "s = u.find_spec('nvidia.nccl');"
+    "print(pathlib.Path(list(s.submodule_search_locations)[0], 'lib') if s else '')"
+)
+
+
+def _nccl_lib_dir(venv: Path) -> str:
+    """Where the venv's NCCL wheel keeps libnccl.so.2.
+
+    DeepEP links NCCL with `-l:libnccl.so.2` but — unlike NVSHMEM — never adds
+    that wheel's lib dir to library_dirs, so the link only works when NCCL is on
+    the default search path (as in vLLM's image, not in a plain venv)."""
+    out = run(
+        [str(venv / "bin" / "python"), "-c", _NCCL_LIB_DIR_SNIPPET], check=False
+    )
+    path = out.stdout.strip() if out.returncode == 0 else ""
+    return path if path and Path(path).is_dir() else ""
+
+
+def _nccl_override(venv: Path, resolution: DeepEPResolution, dest: Path) -> str | None:
+    """Write the uv override that keeps NCCL at the version vLLM's image builds
+    DeepEP against, and return its path.
+
+    DeepEP's Gin backend needs NCCL >= 2.30.4 (ncclGinRequest_t and friends) and
+    resolves NCCL from the Python environment, but torch requires an exact older
+    nvidia-nccl wheel — so any resolve inside the EP installer (it runs
+    `uv pip install cmake torch ninja`) drags NCCL back down and the build dies
+    on missing GIN types.  docker/Dockerfile handles this with UV_OVERRIDE for
+    CUDA 13; mirror it, and only when that wheel is in the venv at all (CUDA 12
+    images do not pin NCCL either)."""
+    if not resolution.nccl_version:
+        return None
+    package = "nvidia-nccl-cu13"
+    shown = run(
+        ["uv", "pip", "show", "--python", str(venv / "bin" / "python"), package],
+        check=False,
+    )
+    if shown.returncode != 0:
+        return None
+    installed = re.search(r"^Version:\s*(\S+)", shown.stdout, re.MULTILINE)
+    if not installed or installed.group(1) != resolution.nccl_version:
+        say(
+            f"DeepEP layer: overriding {package}=={resolution.nccl_version} for "
+            f"the NCCL Gin backend (venv has "
+            f"{installed.group(1) if installed else 'none'})"
+        )
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text(f"{package}=={resolution.nccl_version}\n")
+    return str(dest)
 
 
 def sync_deepep(cfg: Config, root: Path, venv: Path, venv_hash: str) -> None:
@@ -220,6 +282,11 @@ def sync_deepep(cfg: Config, root: Path, venv: Path, venv_hash: str) -> None:
         touch_last_used(entry)
         return
     wheels = _ensure_wheels(cfg, venv, resolution)
+    # The deep_ep wheel requires the Gin-capable NCCL that torch pins away from,
+    # so this install needs the same override the build used.
+    install_env = {}
+    if override := _nccl_override(venv, resolution, entry / "nccl-override.txt"):
+        install_env["UV_OVERRIDE"] = override
     run(
         [
             "uv",
@@ -230,6 +297,7 @@ def sync_deepep(cfg: Config, root: Path, venv: Path, venv_hash: str) -> None:
             "--reinstall",
             *(str(wheel) for wheel in wheels),
         ],
+        env=install_env or None,
         stream_prefix="[ve]   [uv] ",
     )
     update_marker(root, deepep_hash=resolution.key)

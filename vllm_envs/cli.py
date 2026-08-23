@@ -8,13 +8,13 @@ from pathlib import Path
 
 from .config import MARKER_NAME, STORE_NAMES, Config, load_config
 from .extprojects import user_overrides
-from .deepep import resolve as resolve_deepep
+from .extras import resolve as resolve_vllm_extras
 from .fiemap import reflink_usage
 from .gc import collect_candidates, run_gc
 from .hashing import build_key, build_paths_dirty, detect_platform, venv_keys
 from .hooks import (
-    handle_post_commit,
     handle_post_checkout,
+    handle_post_commit,
     handle_post_rewrite,
     init_env,
     install_hook,
@@ -288,8 +288,30 @@ def cmd_status(cfg: Config, args) -> int:
     def state(current: str | None, wanted: str) -> str:
         return "OK" if current == wanted else f"STALE (have {current or 'none'})"
 
-    print(f"venv base:  {keys.base_hash}  {state(m.get('venv_base_hash'), keys.base_hash)}")
-    print(f"venv full:  {keys.full_hash}  {state(m.get('venv_full_hash'), keys.full_hash)}")
+    local_venv = root / ".venv"
+    local_state = state(m.get("venv_full_hash"), keys.full_hash)
+    if not local_venv.is_dir():
+        local_state = "MISSING (run `ve sync`)"
+    print(f"local venv: {local_state}")
+
+    def template_state(store: str, key: str) -> str:
+        entry = cfg.store(store) / key
+        if (entry / ".complete").exists():
+            return "HIT"
+        if entry.is_dir():
+            meta = read_meta(entry)
+            detail = meta.get("stage") or "previous construction did not finish"
+            return f"INCOMPLETE ({detail})"
+        return "MISS"
+
+    print(
+        f"venv base:  {keys.base_hash}  "
+        f"{template_state('venvs-base', keys.base_hash)}"
+    )
+    print(
+        f"venv full:  {keys.full_hash}  "
+        f"{template_state('venvs', keys.full_hash)}"
+    )
     if cfg.with_test and keys.layout.test_files:
         rel = keys.layout.test_files[0].relative_to(root)
         print(f"test deps:  included ({rel})")
@@ -305,17 +327,17 @@ def cmd_status(cfg: Config, args) -> int:
             else "OK (env-local precompiled fallback)"
         )
     print(f"build:      {bhash}  {build_state}")
-    if cfg.with_deepep and platform == "cuda":
+    if cfg.with_vllm_extras and platform == "cuda":
         try:
-            wanted_deepep = resolve_deepep(root, keys.full_hash).key
+            wanted_extras = resolve_vllm_extras(root, keys.full_hash).key
             print(
-                f"DeepEP:     {wanted_deepep}  "
-                f"{state(m.get('deepep_hash'), wanted_deepep)}"
+                f"vLLM extras:{wanted_extras}  "
+                f"{state(m.get('vllm_extras_hash'), wanted_extras)}"
             )
         except RuntimeError:
-            print("DeepEP:     unsupported by this commit")
+            print("vLLM extras: unsupported by this commit")
     else:
-        print("DeepEP:     disabled")
+        print("vLLM extras: disabled")
     if not keys.layout.recognized:
         print("note:       unrecognized requirements layout — coarse hashing in effect")
     if dirty:

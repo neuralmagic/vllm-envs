@@ -62,7 +62,7 @@ class RealVllmLifecycleTest(unittest.TestCase):
                 "VE_ENVS_ROOT": str(self.root / "envs"),
                 "VE_NO_AUTO_INIT": "",
                 "VE_NO_SYNC": "",
-                "VE_WITH_DEEPEP": "1",
+                "VE_WITH_VLLM_EXTRAS": "1",
                 "VE_WITH_TEST": os.environ.get("VE_REAL_E2E_WITH_TEST", "1"),
             }
         )

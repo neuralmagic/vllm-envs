@@ -295,8 +295,10 @@ _BUILD_ENV_NAMES = {
 _BUILD_ENV_PREFIXES = ("CMAKE_", "CUDA_", "TORCH_", "VLLM_")
 
 
-def _command_identity(command: str, *args: str) -> str:
-    """Return a stable identity for a tool selected by this environment."""
+def _command_identity(
+    command: str, *args: str, normalize_root: Path | None = None
+) -> str:
+    """Return a stable tool identity, optionally relative to a movable root."""
     executable = which(command)
     if executable is None:
         return f"{command}:missing"
@@ -308,7 +310,15 @@ def _command_identity(command: str, *args: str) -> str:
     except (OSError, subprocess.SubprocessError) as exc:
         output = f"error:{type(exc).__name__}"
     # Resolve symlinks such as /usr/local/cuda -> cuda-13.0.
-    return f"{Path(executable).resolve()}\n{output}"
+    identity = Path(executable).resolve()
+    if normalize_root is not None:
+        try:
+            identity = Path("<venv>") / identity.relative_to(
+                normalize_root.resolve()
+            )
+        except ValueError:
+            pass
+    return f"{identity}\n{output}"
 
 
 def _distribution_identity(venv: Path, package: str) -> str:
@@ -437,8 +447,8 @@ def build_key(root: Path, platform: str, python: str, venv: Path) -> str:
     compiler = "\n".join([
         _command_identity(os.environ.get("CC", "cc"), "--version"),
         _command_identity(os.environ.get("CXX", "c++"), "--version"),
-        _command_identity(venv_tool("cmake"), "--version"),
-        _command_identity(venv_tool("ninja"), "--version"),
+        _command_identity(venv_tool("cmake"), "--version", normalize_root=venv),
+        _command_identity(venv_tool("ninja"), "--version", normalize_root=venv),
     ])
     libc_name, libc_version = host_platform.libc_ver()
     parts = [
