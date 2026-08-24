@@ -180,11 +180,11 @@ class DeepEPLayerIntegrationTest(unittest.TestCase):
         cfg = Config(cache_dir=root / "cache")
 
         state = {
-            "installed": False,
             "builds": 0,
             "installs": 0,
             "install_command": [],
         }
+        site = venv / "lib" / "python3.13" / "site-packages"
 
         def fake_run(cmd, **kwargs):
             if cmd[0] == "nvidia-smi":
@@ -198,11 +198,12 @@ class DeepEPLayerIntegrationTest(unittest.TestCase):
                 state["builds"] += 1
                 return subprocess.CompletedProcess(cmd, 0, "", "")
             if cmd[:2] == [str(venv / "bin" / "python"), "-c"]:
-                return subprocess.CompletedProcess(
-                    cmd, 0 if state["installed"] else 1, "", ""
-                )
+                return subprocess.CompletedProcess(cmd, 0, "", "")
             if cmd[:3] == ["uv", "pip", "install"]:
-                state["installed"] = True
+                (site / "deep_ep-0.dist-info").mkdir(parents=True, exist_ok=True)
+                (site / "pplx_kernels-0.dist-info").mkdir(
+                    parents=True, exist_ok=True
+                )
                 state["installs"] += 1
                 state["install_command"] = cmd
                 return subprocess.CompletedProcess(cmd, 0, "", "")

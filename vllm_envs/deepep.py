@@ -248,6 +248,16 @@ def _nccl_override(venv: Path, resolution: DeepEPResolution, dest: Path) -> str 
     return str(dest)
 
 
+def _dists_installed(venv: Path, dists: list[str]) -> bool:
+    """Check dist-info presence rather than `import deep_ep`: importing it
+    loads torch, which cost ~3s of wall time on every no-op sync."""
+    sites = list(venv.glob("lib/python*/site-packages"))
+    return all(
+        any(any(site.glob(f"{dist}-*.dist-info")) for site in sites)
+        for dist in dists
+    )
+
+
 def sync_deepep(cfg: Config, root: Path, venv: Path, venv_hash: str) -> None:
     """Install the vLLM-pinned DeepEP wheel into a CUDA environment."""
     installer = root / "tools" / "ep_kernels" / "install_python_libraries.sh"
@@ -258,20 +268,10 @@ def sync_deepep(cfg: Config, root: Path, venv: Path, venv_hash: str) -> None:
     marker = read_marker(root)
     entry = cfg.store("ep-kernels") / resolution.key
     cached_wheels = _wheels(entry)
-    imports = ["deep_ep"]
+    dists = ["deep_ep"]
     if any(w.name.lower().startswith("pplx_kernels-") for w in cached_wheels):
-        imports.append("pplx_kernels")
-    installed = (
-        run(
-            [
-                str(venv / "bin" / "python"),
-                "-c",
-                f"import {', '.join(imports)}",
-            ],
-            check=False,
-        ).returncode
-        == 0
-    )
+        dists.append("pplx_kernels")
+    installed = _dists_installed(venv, dists)
     if (
         marker.get("deepep_hash") == resolution.key
         and (entry / ".complete").exists()
