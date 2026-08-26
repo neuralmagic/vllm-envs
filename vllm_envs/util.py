@@ -2,6 +2,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 from collections import deque
 from pathlib import Path
 
@@ -64,16 +65,61 @@ def git(args: list[str], cwd: Path | str, check: bool = True) -> str:
     return run(["git", *args], cwd=cwd, check=check).stdout.strip()
 
 
+_reflink_support: dict[tuple[int, int], bool] = {}
+
+
+def _supports_reflink(src: Path, dst_parent: Path) -> bool:
+    """Probe and cache reflink support for a source/destination device pair."""
+    devices = (src.stat().st_dev, dst_parent.stat().st_dev)
+    if devices in _reflink_support:
+        return _reflink_support[devices]
+    if devices[0] != devices[1]:
+        _reflink_support[devices] = False
+        return False
+
+    with tempfile.TemporaryDirectory(
+        dir=dst_parent, prefix=".ve-reflink-probe-"
+    ) as probe_dir:
+        probe_src = Path(probe_dir) / "src"
+        probe_dst = Path(probe_dir) / "dst"
+        probe_src.write_bytes(b"\0")
+        result = run(
+            [
+                "cp",
+                "--reflink=always",
+                "--",
+                str(probe_src),
+                str(probe_dst),
+            ],
+            check=False,
+        )
+    supported = result.returncode == 0
+    _reflink_support[devices] = supported
+    return supported
+
+
 def reflink_clone(src: Path, dst: Path) -> None:
-    """Clone a directory tree with XFS/btrfs reflinks, falling back to a copy."""
+    """Clone a directory tree with reflinks, falling back to a plain copy."""
     dst.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        run(["cp", "-a", "--reflink=always", str(src), str(dst)])
-    except subprocess.CalledProcessError:
-        say(f"reflink unsupported, falling back to plain copy: {src} -> {dst}")
-        if dst.exists():
-            shutil.rmtree(dst)
-        run(["cp", "-a", "--reflink=auto", str(src), str(dst)])
+    if _supports_reflink(src, dst.parent):
+        try:
+            run(
+                [
+                    "cp",
+                    "-a",
+                    "--reflink=always",
+                    "--",
+                    str(src),
+                    str(dst),
+                ]
+            )
+            return
+        except subprocess.CalledProcessError:
+            if dst.exists():
+                shutil.rmtree(dst)
+
+    say(f"reflink unsupported, falling back to plain copy: {src} -> {dst}")
+    run(["cp", "-a", "--", str(src), str(dst)])
 
 
 def dir_size_bytes(path: Path) -> int:
