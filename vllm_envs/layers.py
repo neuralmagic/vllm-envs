@@ -152,6 +152,96 @@ def _install_flashinfer_jit_cache(
     )
 
 
+_INDEX_DIRECTIVE_RE = re.compile(r"^\s*--(?:extra-)?index(?:-url)?(?:[=\s]|$)")
+
+# Packages published only on a narrow index, mapped to that index. An
+# ``--extra-index-url`` inside a requirements file applies to the *whole*
+# resolution, so leaving flashinfer.ai in there makes uv query it for every
+# package (starlette, python-json-logger, ...) and the index rate-limits us.
+# Instead the directive is stripped and these are installed scoped, the same
+# way ``_install_flashinfer_jit_cache`` already does.
+_NARROW_INDEX_PACKAGES = {
+    # PyPI stops at 0.6.13; vLLM pins >=0.6.14. See requirements/cuda.txt.
+    "flashinfer-cubin": "https://flashinfer.ai/whl/",
+}
+
+
+def _requirement_name(line: str) -> str:
+    """Normalized distribution name at the start of a requirement line."""
+    match = re.match(r"([A-Za-z0-9][A-Za-z0-9._-]*)", line.split("#", 1)[0].strip())
+    return match.group(1).lower().replace("_", "-") if match else ""
+
+
+def _flatten_reqs_without_index_directives(
+    src: Path, seen: set[Path]
+) -> list[str]:
+    """Inline nested ``-r`` files, dropping index directives.
+
+    Nested files are inlined rather than referenced so the filtering applies
+    all the way down and relative ``-r`` paths keep resolving after the result
+    is written elsewhere. Other directives are passed through untouched.
+    """
+    src = src.resolve()
+    if src in seen:
+        return []
+    seen.add(src)
+    lines: list[str] = []
+    for raw in src.read_text(errors="replace").splitlines():
+        if _INDEX_DIRECTIVE_RE.match(raw):
+            continue
+        stripped = raw.strip()
+        if stripped.startswith("-r "):
+            nested = src.parent / stripped[len("-r "):].strip()
+            lines += _flatten_reqs_without_index_directives(nested, seen)
+            continue
+        if _requirement_name(stripped) in _NARROW_INDEX_PACKAGES:
+            continue
+        lines.append(raw)
+    return lines
+
+
+def _filtered_req_files(files: list[Path], dest_dir: Path) -> list[Path]:
+    """Rewrite *files* into *dest_dir* with index directives removed."""
+    seen: set[Path] = set()
+    filtered = []
+    for src in files:
+        dst = dest_dir / f"{src.stem}.noindex{src.suffix}"
+        dst.write_text(
+            "\n".join(_flatten_reqs_without_index_directives(src, seen)) + "\n"
+        )
+        filtered.append(dst)
+    return filtered
+
+
+def _requirement_spec(files: list[Path], name: str) -> str:
+    """The pinned spec for *name*, or the bare name when it is unpinned."""
+    pattern = re.compile(rf"^\s*({re.escape(name)}\s*[=<>!~][^;#]*)")
+    for f in files:
+        for raw in f.read_text(errors="replace").splitlines():
+            if match := pattern.match(raw.split("#", 1)[0]):
+                return match.group(1).strip()
+    return name
+
+
+def _install_narrow_index_packages(
+    venv: Path, requirement_files: list[Path]
+) -> None:
+    """Install narrow-index packages with the index scoped to just them."""
+    names = requirement_names(requirement_files)
+    for name, index in _NARROW_INDEX_PACKAGES.items():
+        if name not in names:
+            continue
+        _uv_pip(
+            venv,
+            [
+                _requirement_spec(requirement_files, name),
+                "--no-deps",
+                "--index-url",
+                index,
+            ],
+        )
+
+
 def _install_reqs(
     cfg: Config, keys: VenvKeys, venv: Path, requirement_files: list[Path],
     platform: str, cap_dest: Path,
@@ -160,7 +250,11 @@ def _install_reqs(
     chain (minor → major → none) when caps make resolution unsatisfiable —
     stale floors (e.g. tokenizers>=0.21 vs transformers needing >=0.22) can
     conflict under tight caps."""
-    req_args = [arg for f in requirement_files for arg in ("-r", str(f))]
+    req_args = [
+        arg
+        for f in _filtered_req_files(requirement_files, cap_dest.parent)
+        for arg in ("-r", str(f))
+    ]
     mode = cfg.cap
     while True:
         content = cap_constraints(
@@ -206,6 +300,7 @@ def _install_reqs(
             say(f"venv layer: cap={mode} incompatible → trying cap={nxt}")
             mode = nxt
             continue
+        _install_narrow_index_packages(venv, requirement_files)
         _install_flashinfer_jit_cache(
             venv,
             platform,

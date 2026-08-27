@@ -7,13 +7,55 @@ from unittest.mock import call, patch
 
 from vllm_envs.config import Config
 from vllm_envs.layers import (
+    _filtered_req_files,
     _install_flashinfer_jit_cache,
+    _install_narrow_index_packages,
     _install_req_groups,
     _uv_pip,
     ensure_full_template,
     sync,
 )
 from vllm_envs.store import write_meta
+
+
+class NarrowIndexTest(unittest.TestCase):
+    def test_filtering_drops_index_directives_and_inlines_nested_files(self):
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        (root / "common.txt").write_text("numpy==2.0.0\n")
+        (root / "cuda.txt").write_text(
+            "-r common.txt\n"
+            "--extra-index-url https://flashinfer.ai/whl/\n"
+            "flashinfer-python==0.6.16.post3\n"
+            "flashinfer-cubin==0.6.16.post3\n"
+        )
+        dest = root / "out"
+        dest.mkdir()
+
+        filtered = _filtered_req_files([root / "cuda.txt"], dest)
+
+        self.assertEqual(
+            filtered[0].read_text().split(),
+            ["numpy==2.0.0", "flashinfer-python==0.6.16.post3"],
+        )
+
+    def test_narrow_index_package_installed_scoped_to_its_index(self):
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        requirements = root / "cuda.txt"
+        requirements.write_text("flashinfer-cubin==0.6.16.post3\n")
+        venv = root / ".venv"
+
+        with patch("vllm_envs.layers._uv_pip") as uv_pip:
+            _install_narrow_index_packages(venv, [requirements])
+
+        uv_pip.assert_called_once_with(
+            venv,
+            [
+                "flashinfer-cubin==0.6.16.post3",
+                "--no-deps",
+                "--index-url",
+                "https://flashinfer.ai/whl/",
+            ],
+        )
 
 
 class FlashInferJitCacheTest(unittest.TestCase):
