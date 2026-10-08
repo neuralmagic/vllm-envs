@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from . import editable
+from .ccache import max_size_env, stats, summarize
 from .config import SCRATCH_DIR_NAME, Config
 from .extprojects import src_dir_env, user_overrides
 from .extras import sync_vllm_extras
@@ -471,7 +472,9 @@ def _scratch(env_root: Path) -> Path:
     return p
 
 
-def local_build_env(env_root: Path, venv: Path | None = None) -> dict[str, str]:
+def local_build_env(
+    cfg: Config, env_root: Path, venv: Path | None = None
+) -> dict[str, str]:
     """Environment shared by every local C/C++/CUDA compilation."""
     env = {
         "VLLM_DISABLE_SCCACHE": "1",  # local ccache policy
@@ -482,6 +485,9 @@ def local_build_env(env_root: Path, venv: Path | None = None) -> dict[str, str]:
         "CMAKE_C_COMPILER_LAUNCHER": "ccache",
         "CMAKE_CXX_COMPILER_LAUNCHER": "ccache",
         "CMAKE_CUDA_COMPILER_LAUNCHER": "ccache",
+        # Raise ccache's built-in 5 GiB cap, which silently evicts a
+        # vLLM-scale cache (any user configuration is left alone).
+        **max_size_env(cfg),
         # Per-env fetchcontent dir: no cross-env build-dir races for any
         # project we couldn't pin.
         "FETCHCONTENT_BASE_DIR": str(_scratch(env_root) / "fetchcontent"),
@@ -503,7 +509,7 @@ def _build_wheel(
     dist_dir: Path,
     use_pinned_ext: bool,
 ) -> Path:
-    env = local_build_env(env_root, venv)
+    env = local_build_env(cfg, env_root, venv)
     if use_pinned_ext:
         env.update(src_dir_env(cfg, env_root))
     build_temp.mkdir(parents=True, exist_ok=True)
@@ -514,6 +520,7 @@ def _build_wheel(
     dist_dir.mkdir(parents=True, exist_ok=True)
     say(f"building extensions (ccache, build dir {build_temp})...")
     t0 = time.time()
+    ccache_before = stats(env)
     run(
         [
             str(venv / "bin" / "python"),
@@ -536,6 +543,8 @@ def _build_wheel(
         stream_prefix="[ve]   ",
     )
     say(f"build finished in {time.time() - t0:.0f}s")
+    if report := summarize(ccache_before, stats(env)):
+        say(report)
     wheel = _find_wheel(dist_dir)
     if wheel is None:
         raise RuntimeError(f"build produced no wheel in {dist_dir}")
