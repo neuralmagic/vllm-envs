@@ -137,6 +137,11 @@ Warm-cache timing: fresh `ve new`/`ve init` ~7s, no-op `ve sync` ~1s; a cold bui
 [cache]
 max_size_gb = 100      # VE_MAX_SIZE_GB overrides; enforced on reflink-aware physical usage
 min_age_hours = 72
+ccache_max_size_gb = 50  # floor for ccache's cap during ve builds; VE_CCACHE_MAX_SIZE_GB
+                        #   overrides. Applied only while ccache still reports its
+                        #   built-in 5GiB default — any ccache config or CCACHE_MAXSIZE
+                        #   you set always wins. ve builds also print a ccache hit-rate
+                        #   report after each compile.
 
 [core]
 envs_root = "~/vllm-envs"   # VE_ENVS_ROOT overrides

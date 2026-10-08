@@ -7,6 +7,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from vllm_envs.ccache import parse_size, stats, summarize
 from vllm_envs.config import Config
 from vllm_envs.hashing import build_key, build_paths_dirty
 from vllm_envs.layers import _build_wheel, local_build_env, resolve_build
@@ -143,7 +144,7 @@ class LocalBuildCacheIntegrationTest(unittest.TestCase):
         cache = self.base / "ccache"
         env = {
             **os.environ,
-            **local_build_env(self.repo),
+            **local_build_env(self.cfg, self.repo),
             "CCACHE_DIR": str(cache),
         }
 
@@ -157,16 +158,146 @@ class LocalBuildCacheIntegrationTest(unittest.TestCase):
 
         first = compile_in(build_a)
         second = compile_in(build_b)
-        stats = json.loads(subprocess.run(
+        cc_stats = json.loads(subprocess.run(
             ["ccache", "--print-stats", "--format=json"],
             env=env, check=True, capture_output=True, text=True,
         ).stdout)
 
-        self.assertEqual(stats["cache_miss"], 1)
+        self.assertEqual(cc_stats["cache_miss"], 1)
         self.assertEqual(
-            stats["direct_cache_hit"] + stats["preprocessed_cache_hit"], 1
+            cc_stats["direct_cache_hit"] + cc_stats["preprocessed_cache_hit"], 1
         )
         self.assertEqual(first.read_bytes(), second.read_bytes())
+
+    def test_local_build_reports_ccache_hit_rate(self):
+        # ve local builds run under ccache; their output must say how much of
+        # the build was served from cache so a cold/evicted cache is visible.
+        venv = self.make_venv(self.repo)
+        build_temp = self.base / "build-temp"
+        dist = self.base / "dist"
+        snapshots = iter([
+            {"direct_cache_hit": 10, "cache_miss": 2,
+             "cache_size_kibibyte": 1000},
+            {"direct_cache_hit": 110, "cache_miss": 62,
+             "cache_size_kibibyte": 2000},
+        ])
+
+        def fake_run(command, **kwargs):
+            if command[:2] == ["ccache", "--print-stats"]:
+                return subprocess.CompletedProcess(
+                    command, 0, json.dumps(next(snapshots)), ""
+                )
+            dist.mkdir(parents=True, exist_ok=True)
+            (dist / "vllm-current.whl").write_bytes(b"wheel")
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        reported = []
+        with (
+            patch("vllm_envs.ccache.run", side_effect=fake_run),
+            patch("vllm_envs.layers.run", side_effect=fake_run),
+            patch("vllm_envs.layers.say", side_effect=reported.append),
+        ):
+            _build_wheel(self.cfg, self.repo, venv, build_temp, dist, True)
+
+        self.assertTrue(
+            any("ccache: 100 hits / 60 misses (62%)" in line for line in reported)
+        )
+
+    def test_local_build_survives_unusable_ccache_stats(self):
+        # A host without ccache (or one where --print-stats fails) must not
+        # fail the build itself.
+        venv = self.make_venv(self.repo)
+        build_temp = self.base / "build-temp"
+        dist = self.base / "dist"
+
+        def fake_run(command, **kwargs):
+            if command[:2] == ["ccache", "--print-stats"]:
+                return subprocess.CompletedProcess(command, 1, "", "no ccache")
+            dist.mkdir(parents=True, exist_ok=True)
+            (dist / "vllm-current.whl").write_bytes(b"wheel")
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        with (
+            patch("vllm_envs.ccache.run", side_effect=fake_run),
+            patch("vllm_envs.layers.run", side_effect=fake_run),
+        ):
+            wheel = _build_wheel(self.cfg, self.repo, venv, build_temp, dist, True)
+
+        self.assertEqual(wheel.name, "vllm-current.whl")
+
+    def test_local_build_env_raises_builtin_ccache_cap(self):
+        # ccache's built-in 5 GiB cap silently evicts a vLLM-scale cache;
+        # ve raises it for its own builds when the user has not set one.
+        def ccache_config(command, **kwargs):
+            if command[:3] == ["ccache", "--get-config", "max_size"]:
+                return subprocess.CompletedProcess(command, 0, "5.0 GiB\n", "")
+            return subprocess.CompletedProcess(command, 1, "", "")
+
+        with (
+            patch.dict("os.environ", {"CCACHE_MAXSIZE": ""}),
+            patch("vllm_envs.ccache.run", side_effect=ccache_config),
+        ):
+            env = local_build_env(self.cfg, self.repo)
+
+        self.assertEqual(env["CCACHE_MAXSIZE"], "50G")
+
+    def test_local_build_env_respects_user_ccache_cap(self):
+        for configured in ("20.0 GiB", "500G", "0"):  # user value, incl. unlimited
+            def ccache_config(command, configured=configured, **kwargs):
+                if command[:3] == ["ccache", "--get-config", "max_size"]:
+                    return subprocess.CompletedProcess(
+                        command, 0, f"{configured}\n", ""
+                    )
+                return subprocess.CompletedProcess(command, 1, "", "")
+
+            with (
+                patch.dict("os.environ", {"CCACHE_MAXSIZE": ""}),
+                patch("vllm_envs.ccache.run", side_effect=ccache_config),
+            ):
+                env = local_build_env(self.cfg, self.repo)
+
+            self.assertNotIn("CCACHE_MAXSIZE", env)
+
+    def test_local_build_env_env_var_cap_wins(self):
+        def ccache_config(command, **kwargs):
+            if command[:3] == ["ccache", "--get-config", "max_size"]:
+                return subprocess.CompletedProcess(command, 0, "5.0 GiB\n", "")
+            return subprocess.CompletedProcess(command, 1, "", "")
+
+        with (
+            patch.dict("os.environ", {"CCACHE_MAXSIZE": "7G"}),
+            patch("vllm_envs.ccache.run", side_effect=ccache_config),
+        ):
+            env = local_build_env(self.cfg, self.repo)
+
+        self.assertNotIn("CCACHE_MAXSIZE", env)  # user env var passes through
+
+    def test_parse_size(self):
+        self.assertEqual(parse_size("5.0 GiB"), 5 * 1024**3)
+        self.assertEqual(parse_size("50G"), 50 * 1024**3)
+        self.assertEqual(parse_size("1.5M"), int(1.5 * 1024**2))
+        self.assertEqual(parse_size("1024"), 1024)
+        self.assertIsNone(parse_size(""))
+        self.assertIsNone(parse_size("not a size"))
+
+    def test_summarize_reports_hit_rate_and_eviction_hint(self):
+        cold = {"direct_cache_hit": 0, "cache_miss": 0}
+        after_cold = {"direct_cache_hit": 3, "cache_miss": 300}
+        line = summarize(cold, after_cold)
+        self.assertIn("3 hits / 300 misses (1%)", line)
+        self.assertIn("cold or evicted", line)
+
+        warm = summarize(
+            {"direct_cache_hit": 0, "cache_miss": 0, "cache_size_kibibyte": 5},
+            {"direct_cache_hit": 500, "cache_miss": 5, "cache_size_kibibyte": 5},
+        )
+        self.assertIn("500 hits / 5 misses (99%)", warm)
+        self.assertNotIn("cold or evicted", warm)
+
+        self.assertIsNone(summarize(None, None))
+        self.assertEqual(
+            summarize(cold, cold), "ccache: no cacheable compilations"
+        )
 
     def test_local_wheel_is_built_once_then_packaged_without_rebuild(self):
         venv = self.make_venv(self.repo)
@@ -203,7 +334,7 @@ class LocalBuildCacheIntegrationTest(unittest.TestCase):
         ninja.chmod(0o755)
 
         with patch.dict("os.environ", {"PATH": "/usr/bin"}):
-            env = {**os.environ, **local_build_env(self.repo, venv)}
+            env = {**os.environ, **local_build_env(self.cfg, venv)}
             found = subprocess.run(
                 ["ninja"], env=env, check=True, capture_output=True, text=True,
             )

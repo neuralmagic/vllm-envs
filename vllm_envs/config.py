@@ -42,6 +42,8 @@ class Config:
     cap: str = "minor"  # cap unpinned requirement floors: minor | major | none
     with_test: bool = True  # install & cache requirements/test/<platform>.txt
     with_vllm_extras: bool = True  # install vLLM's optional runtime bundle
+    # Floor for ccache's cap during ve builds (see vllm_envs.ccache).
+    ccache_max_size_gb: float = 50.0
     raw: dict = field(default_factory=dict)
 
     @property
@@ -65,6 +67,9 @@ def load_config() -> Config:
         cache = data.get("cache", {})
         cfg.max_size_gb = float(cache.get("max_size_gb", cfg.max_size_gb))
         cfg.min_age_hours = float(cache.get("min_age_hours", cfg.min_age_hours))
+        cfg.ccache_max_size_gb = float(
+            cache.get("ccache_max_size_gb", cfg.ccache_max_size_gb)
+        )
         core = data.get("core", {})
         cfg.envs_root = Path(core.get("envs_root", cfg.envs_root)).expanduser()
         cfg.python = str(core.get("python", cfg.python))
@@ -77,6 +82,8 @@ def load_config() -> Config:
         )
     if v := os.environ.get("VE_MAX_SIZE_GB"):
         cfg.max_size_gb = float(v)
+    if v := os.environ.get("VE_CCACHE_MAX_SIZE_GB"):
+        cfg.ccache_max_size_gb = float(v)
     if v := os.environ.get("VE_ENVS_ROOT"):
         cfg.envs_root = Path(v)
     if v := os.environ.get("VE_CAP"):
