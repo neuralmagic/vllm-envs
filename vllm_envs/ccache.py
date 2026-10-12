@@ -11,7 +11,6 @@ CCACHE_NOHASHDIR), which leaves two silent failure modes:
   evicted cache is diagnosable from the build output alone.
 """
 
-import json
 import os
 import re
 from shutil import which
@@ -67,16 +66,17 @@ def stats(env: dict[str, str] | None = None) -> dict | None:
     """Snapshot ccache's counters in the environment ve builds in."""
     if which("ccache") is None:
         return None
-    proc = run(
-        ["ccache", "--print-stats", "--format=json"], env=env, check=False
-    )
+    # Plain format, not --format=json: some ccache builds (e.g. Debian's
+    # 4.9) reject the flag, and the tab-separated keys match the JSON names.
+    proc = run(["ccache", "--print-stats"], env=env, check=False)
     if proc.returncode != 0:
         return None
-    try:
-        data = json.loads(proc.stdout)
-    except ValueError:
-        return None
-    return data if isinstance(data, dict) else None
+    out: dict[str, str] = {}
+    for line in proc.stdout.splitlines():
+        key, sep, value = line.partition("\t")
+        if sep:
+            out[key] = value
+    return out or None
 
 
 def summarize(before: dict | None, after: dict | None) -> str | None:
