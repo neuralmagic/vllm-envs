@@ -11,19 +11,18 @@ import os
 import platform as host_platform
 import re
 import subprocess
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 from shutil import which
 
-from .config import BUILD_LAYER_PATHS, DEFAULT_CACHE_DIR
+from . import rules
+from .config import DEFAULT_CACHE_DIR
+from .sitepkgs import dist_infos
+from .treefacts import ReqLayout, TreeFacts, facts_for
 from .util import run
 
 TORCH_PIN_RE = re.compile(r"^(torch|torchaudio|torchvision|nvidia-|triton)", re.I)
-GENERATED_BUILD_OUTPUT_RE = re.compile(
-    r"^csrc/(?:libtorch_stable/)?(?:quantization/marlin|moe/marlin_moe_wna16)/"
-    r"(?:sm\d+_kernel_.*\.cu|kernel_selector\.h)$"
-)
 
 
 @lru_cache(maxsize=1)
@@ -81,129 +80,20 @@ def _sha(parts: list[str]) -> str:
     return h.hexdigest()[:12]
 
 
-def _hash_file(path: Path) -> str:
+def file_sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-@dataclass
-class ReqLayout:
-    """Platform-relevant requirements files for a given worktree."""
-
-    build_files: list[Path]  # heavy layer (torch + build deps)
-    runtime_files: list[Path]  # top-up layer
-    recognized: bool
-    test_files: list[Path] = field(default_factory=list)  # optional test deps
+def requirements_layout(
+    root: Path, platform: str, with_test: bool = False,
+    facts: TreeFacts | None = None,
+) -> ReqLayout:
+    return (facts or facts_for(root, platform)).layout(with_test)
 
 
-def requirements_layout(root: Path, platform: str, with_test: bool = False) -> ReqLayout:
-    req = root / "requirements"
-
-    def existing(*paths: Path) -> list[Path]:
-        return [p for p in paths if p.is_file()]
-
-    # Modern layout: requirements/build/<platform>.txt
-    build = existing(req / "build" / f"{platform}.txt")
-    if not build:
-        # Mid-era layout: requirements/build.txt
-        build = existing(req / "build.txt")
-    runtime = existing(
-        req / "common.txt",
-        req / f"{platform}.txt",
-        req / "lint.txt",
-    )
-    if not runtime:
-        # Old layout: root-level requirements-*.txt
-        runtime = existing(
-            root / "requirements-common.txt",
-            root / f"requirements-{platform}.txt",
-            root / "requirements-lint.txt",
-        )
-        build = build or existing(root / "requirements-build.txt")
-    test_files: list[Path] = []
-    if with_test:
-        # prefer the pinned lock; fall back to unpinned .in (non-x86_64 / no lock)
-        test_files = existing(
-            req / "test" / f"{platform}.txt",
-            req / "test" / f"{platform}.in",
-            req / "test.in",
-            root / "requirements-test.txt",
-        )[:1]
-
-    if build and runtime:
-        return ReqLayout(build, runtime, recognized=True, test_files=test_files)
-
-    # Unrecognized layout: hash everything requirements-ish (coarse but correct).
-    all_reqs = sorted(
-        set(root.glob("requirements*")) | set(req.rglob("*")) if req.is_dir() else set(root.glob("requirements*"))
-    )
-    all_reqs = [p for p in all_reqs if p.is_file()]
-    return ReqLayout(all_reqs, all_reqs, recognized=False)
-
-
-_REQ_NAME_RE = re.compile(r"^([A-Za-z0-9][A-Za-z0-9._-]*)")
-_FLOOR_RE = re.compile(r">=?\s*v?(\d+(?:\.\d+)*)")
-_CEILING_RE = re.compile(r"<|==|~=")
-
-
-def requirement_names(files: list[Path]) -> set[str]:
-    names = set()
-    for f in files:
-        for raw in f.read_text(errors="replace").splitlines():
-            line = raw.split("#", 1)[0].strip()
-            if not line or line.startswith("-") or "://" in line:
-                continue
-            if match := _REQ_NAME_RE.match(line):
-                names.add(match.group(1).lower().replace("_", "-"))
-    return names
-
-
-def _derived_requirement_parts(files: list[Path]) -> list[str]:
-    if "flashinfer-python" in requirement_names(files):
-        return ["derived:flashinfer-jit-cache:v1"]
-    return []
-
-
-def cap_constraints(files: list[Path], mode: str) -> str:
-    """Constraint lines capping requirements that have a version floor but no
-    ceiling: `pkg>=X.Y.Z` → `pkg<X.(Y+1)` (minor) or `pkg<(X+1)` (major), so
-    unpinned deps resolve near the floor's era instead of to latest. The
-    highest floor wins when a package appears in several files."""
-    if mode == "none":
-        return ""
-    floors: dict[str, tuple[tuple[int, ...], str]] = {}
-    # A lock file commonly pins a package while an input requirement keeps its
-    # lower bound.  Do not generate a synthetic cap from the lower bound in
-    # that case: ``pyzmq>=25`` must not become ``pyzmq<26`` when the selected
-    # test lock explicitly requires ``pyzmq==27.1.0``.
-    explicitly_bounded: set[str] = set()
-    for f in files:
-        for raw in f.read_text(errors="replace").splitlines():
-            line = raw.split("#", 1)[0].strip()
-            if not line or line.startswith("-") or "://" in line:
-                continue
-            spec = line.split(";", 1)[0].strip()
-            m = _REQ_NAME_RE.match(spec)
-            if not m:
-                continue
-            name, rest = m.group(1), spec[len(m.group(1)):]
-            key = name.lower().replace("_", "-")
-            if _CEILING_RE.search(rest):
-                explicitly_bounded.add(key)
-                continue
-            fm = _FLOOR_RE.search(rest)
-            if not fm:
-                continue
-            floor = tuple(int(x) for x in fm.group(1).split("."))
-            if key not in floors or floor > floors[key][0]:
-                floors[key] = (floor, name)
-    lines = []
-    for key, (floor, name) in sorted(floors.items()):
-        if key in explicitly_bounded:
-            continue
-        parts = [*floor, 0, 0]
-        bound = f"{parts[0] + 1}" if mode == "major" else f"{parts[0]}.{parts[1] + 1}"
-        lines.append(f"{name}<{bound}\n")
-    return "".join(lines)
+def _derived_requirement_parts(files: list[Path], facts: TreeFacts) -> list[str]:
+    """Venv-key parts of the rules that fire for these requirement files."""
+    return rules.key_parts(facts.context(files), "venv")
 
 
 def torch_pin_lines(files: list[Path]) -> list[str]:
@@ -220,13 +110,15 @@ class VenvKeys:
     base_hash: str
     full_hash: str
     layout: ReqLayout
+    facts: TreeFacts | None = None
 
 
 def venv_keys(
     root: Path, platform: str, python: str, with_test: bool = False,
-    cap: str = "minor",
+    cap: str = "minor", facts: TreeFacts | None = None,
 ) -> VenvKeys:
-    layout = requirements_layout(root, platform, with_test)
+    facts = facts or facts_for(root, platform)
+    layout = facts.layout(with_test)
     cuda = cuda_version() if platform == "cuda" else "n/a"
     base_parts = [
         "v1",
@@ -235,8 +127,8 @@ def venv_keys(
         cuda,
         # cap="none" stays un-folded so pre-capping templates keep their keys
         *([f"cap:{cap}"] if cap != "none" else []),
-        *(f"{p.name}:{_hash_file(p)}" for p in layout.build_files),
-        *_derived_requirement_parts(layout.build_files),
+        *(f"{p.name}:{file_sha256(p)}" for p in layout.build_files),
+        *_derived_requirement_parts(layout.build_files, facts),
         # torch pins from runtime files fold into the base key so a torch bump
         # rebuilds the base template instead of a heavy top-up in the full layer
         *torch_pin_lines(layout.runtime_files),
@@ -244,11 +136,17 @@ def venv_keys(
     base_hash = _sha(base_parts)
     full_parts = [
         base_hash,
-        *(f"{p.relative_to(root)}:{_hash_file(p)}" for p in layout.runtime_files),
-        *(f"{p.relative_to(root)}:{_hash_file(p)}" for p in layout.test_files),
-        *_derived_requirement_parts([*layout.runtime_files, *layout.test_files]),
+        *(f"{p.relative_to(root)}:{file_sha256(p)}" for p in layout.runtime_files),
+        *(f"{p.relative_to(root)}:{file_sha256(p)}" for p in layout.test_files),
+        *_derived_requirement_parts(
+            [*layout.runtime_files, *layout.test_files], facts
+        ),
     ]
-    return VenvKeys(base_hash, _sha(full_parts), layout)
+    return VenvKeys(base_hash, _sha(full_parts), layout, facts)
+
+
+def _generated_output(path: str) -> bool:
+    return any(p.match(path) for p in rules.untracked_ignores())
 
 
 def worktree_content_hash(root: Path, paths: tuple[str, ...]) -> str:
@@ -261,13 +159,11 @@ def worktree_content_hash(root: Path, paths: tuple[str, ...]) -> str:
         ["git", "ls-files", "-o", "--exclude-standard", "-z", "--", *paths],
         cwd=root,
     ).stdout.split("\0")
-    # Several vLLM releases generate Marlin instantiations into csrc itself.
-    # They survive a checkout because Git preserves untracked files, but they
-    # are build outputs rather than user source edits. Never ignore a tracked
-    # path, even if a future release starts committing one of these files.
+    # Untracked build outputs (rules' IgnoreUntracked) are not source edits.
+    # Never ignore a tracked path, even if a release starts committing one.
     files = sorted(
         {f for f in tracked if f}
-        | {f for f in untracked if f and not GENERATED_BUILD_OUTPUT_RE.match(f)}
+        | {f for f in untracked if f and not _generated_output(f)}
     )
     present = [f for f in files if (root / f).is_file()]
     deleted = [f for f in files if not (root / f).exists()]
@@ -287,12 +183,20 @@ def worktree_content_hash(root: Path, paths: tuple[str, ...]) -> str:
     return _sha(["v1", *parts])
 
 
+# Variables vLLM's setup.py/CMake (or the compilers they drive) read when
+# building extensions. An allowlist: runtime knobs (VLLM_LOGGING_LEVEL,
+# CUDA_LAUNCH_BLOCKING, ...) and GPU reservations must not split the cache.
+# *_SRC_DIR overrides are handled separately (they disable build caching).
 _BUILD_ENV_NAMES = {
-    "CC", "CFLAGS", "CMAKE_ARGS", "CUDA_HOME", "CUDA_PATH",
-    "CUDA_VISIBLE_DEVICES", "CXX", "CXXFLAGS", "LDFLAGS",
-    "NVCC_APPEND_FLAGS", "TORCH_CUDA_ARCH_LIST",
+    "CC", "CXX", "CFLAGS", "CXXFLAGS", "LDFLAGS", "CMAKE_ARGS",
+    "CMAKE_BUILD_TYPE", "CUDA_HOME", "CUDA_PATH", "NVCC_APPEND_FLAGS",
+    "NVCC_PREPEND_FLAGS", "NVCC_THREADS", "TORCH_CUDA_ARCH_LIST",
+    "PYTORCH_ROCM_ARCH", "ROCM_PATH", "ACL_ROOT_DIR", "TORCH_NIGHTLY",
+    "VLLM_TARGET_DEVICE", "VLLM_MAIN_CUDA_VERSION", "VLLM_CPU_X86",
+    "VLLM_CPU_ARM_BF16", "VLLM_CPU_ARM_I8MM", "VLLM_CPU_RVV_BF16",
+    "VLLM_REQUIRE_RUST_FRONTEND", "VLLM_VERSION_OVERRIDE",
+    "VLLM_SKIP_VERSION_SUFFIX", "VLLM_SKIP_PRECOMPILED_VERSION_SUFFIX",
 }
-_BUILD_ENV_PREFIXES = ("CMAKE_", "CUDA_", "TORCH_", "VLLM_")
 
 
 def _command_identity(
@@ -323,12 +227,7 @@ def _command_identity(
 
 def _distribution_identity(venv: Path, package: str) -> str:
     """Fingerprint an installed wheel without importing its package."""
-    candidates = sorted(
-        p
-        for lib in venv.glob("lib*")
-        for p in lib.glob(f"python*/site-packages/{package}-*.dist-info")
-        if p.is_dir()
-    )
+    candidates = dist_infos(venv, package)
     if not candidates:
         return f"{package}:missing"
     dist = candidates[-1]
@@ -337,7 +236,7 @@ def _distribution_identity(venv: Path, package: str) -> str:
     # incomplete/nonstandard RECORD files.
     for name in ("METADATA", "WHEEL", "RECORD"):
         path = dist / name
-        parts.append(f"{name}:{_hash_file(path) if path.is_file() else 'missing'}")
+        parts.append(f"{name}:{file_sha256(path) if path.is_file() else 'missing'}")
     return "\n".join(parts)
 
 
@@ -386,9 +285,9 @@ def _gpu_target_identity() -> str:
     if arches := os.environ.get("TORCH_CUDA_ARCH_LIST"):
         return f"TORCH_CUDA_ARCH_LIST={arches}"
     # Reading the driver's inventory is effectively free, unlike spawning
-    # nvidia-smi (~100-500ms). The ordered model list plus the separately
-    # hashed CUDA_VISIBLE_DEVICES/CUDA_DEVICE_ORDER identifies the same set of
-    # auto-detected compilation targets without tying reuse to GPU UUIDs.
+    # nvidia-smi (~100-500ms). Auto-detected targets depend on the *set* of
+    # visible GPU models: on a homogeneous host that set is the same whatever
+    # CUDA_VISIBLE_DEVICES says, so only mixed hosts key on visibility.
     inventory = Path("/proc/driver/nvidia/gpus")
     models: list[str] = []
     if inventory.is_dir():
@@ -403,7 +302,11 @@ def _gpu_target_identity() -> str:
                 continue
             models.append(model)
     if models:
-        return "driver-models:" + "|".join(models)
+        distinct = sorted(set(models))
+        identity = "driver-models:" + "|".join(distinct)
+        if len(distinct) > 1:
+            identity += ":visible=" + os.environ.get("CUDA_VISIBLE_DEVICES", "*")
+        return identity
     executable = which("nvidia-smi")
     if executable is None:
         return "gpu-target:unavailable"
@@ -428,18 +331,15 @@ def _gpu_target_identity() -> str:
 def _build_environment_identity() -> str:
     values = {
         name: value for name, value in os.environ.items()
-        if name in _BUILD_ENV_NAMES or name.startswith(_BUILD_ENV_PREFIXES)
+        if name in _BUILD_ENV_NAMES
     }
-    # These control ve's attach mechanism, not local compiler output.
-    values.pop("VLLM_USE_PRECOMPILED", None)
-    values.pop("VLLM_PRECOMPILED_WHEEL_LOCATION", None)
     return json.dumps(values, sort_keys=True, separators=(",", ":"))
 
 
 def build_key(root: Path, platform: str, python: str, venv: Path) -> str:
     """Hash every input that can affect a reusable compiled vLLM wheel."""
     cuda = cuda_version() if platform == "cuda" else "n/a"
-    tree = worktree_content_hash(root, BUILD_LAYER_PATHS)
+    tree = worktree_content_hash(root, facts_for(root, platform).build_layer_paths)
     def venv_tool(name: str) -> str:
         candidate = venv / "bin" / name
         return str(candidate) if candidate.is_file() else name
@@ -470,14 +370,16 @@ def build_key(root: Path, platform: str, python: str, venv: Path) -> str:
     return _sha(parts)
 
 
-def build_paths_dirty(root: Path) -> bool:
-    """True if the working tree is dirty for build-layer paths."""
+def build_paths_dirty(root: Path, paths: tuple[str, ...] | None = None) -> bool:
+    """True if the working tree is dirty for the given (build-layer) paths."""
+    if paths is None:
+        paths = facts_for(root, detect_platform()).build_layer_paths
     lines = run(
-        ["git", "status", "--porcelain", "--untracked-files=all", "--",
-         *BUILD_LAYER_PATHS], cwd=root
+        ["git", "status", "--porcelain", "--untracked-files=all", "--", *paths],
+        cwd=root,
     ).stdout.splitlines()
     for line in lines:
-        if line.startswith("?? ") and GENERATED_BUILD_OUTPUT_RE.match(line[3:]):
+        if line.startswith("?? ") and _generated_output(line[3:]):
             continue
         return True
     return False

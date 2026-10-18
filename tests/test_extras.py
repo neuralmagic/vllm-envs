@@ -4,6 +4,9 @@ from pathlib import Path
 from unittest.mock import patch
 
 from vllm_envs.extras import ExtrasResolution, _sync_kv_connectors, resolve
+from vllm_envs.rules import RULES
+
+KV_PATCHES = next(r for r in RULES if r.id == "kv-installer-venv").then
 
 
 class ExtrasResolutionTest(unittest.TestCase):
@@ -18,13 +21,15 @@ class ExtrasResolutionTest(unittest.TestCase):
             requirements.write_text("nixl==1\n")
 
             with patch("vllm_envs.extras.resolve_deepep", side_effect=RuntimeError):
-                first = resolve(root, "venv-key")
+                first = resolve(root, "base-key", "venv-key")
                 requirements.write_text("nixl==2\n")
-                second = resolve(root, "venv-key")
+                second = resolve(root, "base-key", "venv-key")
 
             self.assertNotEqual(first.key, second.key)
             self.assertEqual(second.kv_installer, installer)
             self.assertEqual(second.kv_requirements, requirements)
+            self.assertEqual(second.kv_patches, KV_PATCHES)
+            self.assertEqual(second.kv_rules, ("rule:kv-installer-venv@1",))
 
     def test_kv_helper_targets_managed_virtual_environment(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -36,7 +41,9 @@ class ExtrasResolutionTest(unittest.TestCase):
                 'uv pip install --system -r "$KV_CONNECTORS_REQUIREMENTS"\n'
             )
             requirements.write_text("nixl==1\n")
-            resolution = ExtrasResolution("key", installer, requirements)
+            resolution = ExtrasResolution(
+                "key", installer, requirements, kv_patches=KV_PATCHES
+            )
             observed = {}
 
             def fake_run(command, **kwargs):
@@ -44,10 +51,10 @@ class ExtrasResolutionTest(unittest.TestCase):
                 observed["env"] = kwargs["env"]
 
             with (
-                patch("vllm_envs.extras._has_import", return_value=False),
-                patch("vllm_envs.extras.run", side_effect=fake_run),
+                patch("vllm_envs.extras.dists_installed", return_value=False),
+                patch("vllm_envs.util.run", side_effect=fake_run),
             ):
-                _sync_kv_connectors(venv, resolution)
+                _sync_kv_connectors(root, venv, resolution, "venv-hash")
 
             self.assertNotIn("--system", observed["script"])
             self.assertEqual(observed["env"]["VIRTUAL_ENV"], str(venv))

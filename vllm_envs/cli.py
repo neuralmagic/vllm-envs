@@ -1,526 +1,13 @@
+"""`ve` argument parsing and entry point; commands live in vllm_envs.commands."""
+
 import argparse
-import re
-import shutil
-import subprocess
 import sys
-import time
-from pathlib import Path
 
-from .config import MARKER_NAME, STORE_NAMES, Config, load_config
-from .extprojects import user_overrides
-from .extras import resolve as resolve_vllm_extras
-from .fiemap import reflink_usage
-from .gc import collect_candidates, run_gc
-from .hashing import build_key, build_paths_dirty, detect_platform, venv_keys
-from .hooks import (
-    handle_post_checkout,
-    handle_post_commit,
-    handle_post_rewrite,
-    init_env,
-    install_hook,
-)
-from .layers import sync
-from .log import die, say, warn
-from .registry import (
-    live_envs,
-    read_marker,
-    register_env,
-    unregister_env,
-    write_marker,
-)
-from .store import read_meta, write_meta
-from .util import git, human_size, run
-
-
-def _repo_root(path: Path) -> Path:
-    try:
-        return Path(git(["rev-parse", "--show-toplevel"], cwd=path))
-    except Exception:
-        die(f"not inside a git repository: {path}")
-        raise
-
-
-def _env_root_from_cwd() -> Path:
-    root = _repo_root(Path.cwd())
-    if not (root / MARKER_NAME).exists():
-        die(f"not inside a ve-managed env (no {MARKER_NAME} in {root})")
-    return root
-
-
-def cmd_new(cfg: Config, args) -> int:
-    repo = _repo_root(Path(args.repo) if args.repo else Path.cwd())
-    if not (repo / "setup.py").exists():
-        warn(f"{repo} does not look like a vLLM checkout (no setup.py)")
-    name = args.name or re.sub(r"[^A-Za-z0-9._\-]", "-", args.ref)
-    dest = cfg.envs_root / name
-    if dest.exists():
-        die(f"env '{name}' already exists at {dest} (use --name or `ve rm {name}`)")
-    cfg.envs_root.mkdir(parents=True, exist_ok=True)
-
-    say(f"creating worktree {dest} at {args.ref}")
-    run(
-        ["git", "worktree", "add", "--detach", str(dest), args.ref],
-        cwd=repo,
-        env={"VE_NO_AUTO_INIT": "1"},  # ve new does its own init below
-        stream_prefix="[ve]   [git] ",
-    )
-    install_hook(repo)
-    write_marker(dest, {"name": name, "repo": str(repo), "created_at": time.time()})
-    register_env(cfg, name, dest, repo)
-    t0 = time.time()
-    sync(cfg, dest, fresh_venv=False)
-    say(f"env '{name}' ready in {time.time() - t0:.0f}s: {dest}")
-    say(f"activate with: source {dest}/.venv/bin/activate")
-    return 0
-
-
-def cmd_init(cfg: Config, args) -> int:
-    root = _repo_root(Path.cwd())
-    if (root / MARKER_NAME).exists():
-        die(f"already a ve-managed env: {root} (use `ve sync`)")
-    if not (root / "setup.py").exists():
-        warn(f"{root} does not look like a vLLM checkout (no setup.py)")
-    t0 = time.time()
-    name = init_env(cfg, root, args.name)
-    say(f"env '{name}' ready in {time.time() - t0:.0f}s: {root}")
-    say(f"activate with: source {root}/.venv/bin/activate")
-    say("(or `ve activate` after adding to your shell rc: "
-        'eval "$(ve shellenv)")')
-    return 0
-
-
-SHELL_FUNC = """\
-ve() {
-    if [ "$1" = "activate" ]; then
-        local _ve_root _ve_act
-        _ve_root=$(command git rev-parse --show-toplevel 2>/dev/null) || {
-            echo "[ve] not inside a git repo" >&2; return 1; }
-        _ve_act="$_ve_root/.venv/bin/activate"
-        [ -f "$_ve_act" ] || {
-            echo "[ve] no venv at $_ve_root/.venv — run 've sync'" >&2; return 1; }
-        . "$_ve_act"
-    else
-        command ve "$@"
-    fi
-}
-"""
-
-
-def cmd_shellenv(cfg: Config, args) -> int:
-    print(SHELL_FUNC, end="")
-    return 0
-
-
-def cmd_activate(cfg: Config, args) -> int:
-    # only reached without the shellenv function; the function sources directly
-    root = _env_root_from_cwd()
-    activate = root / ".venv" / "bin" / "activate"
-    if not activate.exists():
-        die(f"no venv at {root / '.venv'} — run `ve sync`")
-    print(f"source {activate}")
-    warn("run the line above (or just `source .venv/bin/activate`); to make "
-         "`ve activate` work directly, add to your shell rc: "
-         'eval "$(ve shellenv)"')
-    return 0
-
-
-def cmd_sync(cfg: Config, args) -> int:
-    env_root = _env_root_from_cwd()
-    try:
-        sync(cfg, env_root, fresh_venv=args.fresh_venv)
-    except Exception as e:
-        warn(f"sync failed: {e}")
-        warn("previous .venv retained; its hashes may be STALE for this checkout")
-        return 1
-    return 0
-
-
-def cmd_rm(cfg: Config, args) -> int:
-    envs = live_envs(cfg)
-    if args.name not in envs:
-        die(f"unknown env '{args.name}' (known: {', '.join(sorted(envs)) or 'none'})")
-    dest = envs[args.name]
-    repo = Path(read_marker(dest).get("repo", ""))
-    if str(repo) and repo.resolve() == dest.resolve():
-        say(f"'{args.name}' is an in-place env (ve init): unmanaging, "
-            "leaving the checkout intact")
-        (dest / MARKER_NAME).unlink(missing_ok=True)
-        unregister_env(cfg, args.name)
-        return 0
-    say(f"removing env '{args.name}' at {dest}")
-    if repo.is_dir():
-        run(
-            ["git", "worktree", "remove", "--force", str(dest)],
-            cwd=repo,
-            check=False,
-        )
-    if dest.exists():
-        shutil.rmtree(dest, ignore_errors=True)
-    unregister_env(cfg, args.name)
-    say("removed (shared caches untouched)")
-    return 0
-
-
-def cmd_list(cfg: Config, args) -> int:
-    envs = live_envs(cfg)
-    if not envs:
-        say("no envs")
-        return 0
-    for name, path in sorted(envs.items()):
-        m = read_marker(path)
-        head = git(["rev-parse", "--short", "HEAD"], cwd=path) if path.exists() else "?"
-        print(f"{name:24s} {head:12s} {path}  (build={m.get('build_hash') or 'private'})")
-    return 0
-
-
-def _reap_repo(cfg: Config) -> Path:
-    try:
-        return _repo_root(Path.cwd())
-    except SystemExit:
-        for path in live_envs(cfg).values():
-            repo = Path(read_marker(path).get("repo", "")) or path
-            if (repo / ".git").exists():
-                return repo
-        die("not inside a git repo; run `ve reap` from a repo checkout")
-        raise
-
-
-def _print_worktrees(wts: list) -> None:
-    from .worktrees import age_str
-
-    order = {"archived": 0, "deleted": 0, "orphan": 1, "active": 2,
-             "external": 3, "primary": 4}
-    wts = sorted(wts, key=lambda w: (order.get(w.state, 9), -(w.activity or 0)))
-    print(f"{'worktree':22s} {'state':9s} {'act':>4s} {'tree':>6s} "
-          f"{'sync':>8s} {'reap':16s} branch")
-    n_safe = n_cand = 0
-    for w in wts:
-        tree = "clean" if not w.dirty else f"{w.dirty}drt"
-        if w.is_candidate:
-            n_cand += 1
-            safe, reason = w.safety()
-            n_safe += safe
-            reap = "SAFE" if safe else f"blocked:{reason.split()[0]}"
-        else:
-            reap = "-"
-        print(f"{w.path.name:22s} {w.state:9s} {age_str(w.activity):>4s} "
-              f"{tree:>6s} {w.sync:>8s} {reap:16s} {w.branch[:40]}")
-    print(f"\n{n_cand} stale ({n_safe} safe to reap). "
-          "reap all safe: `ve reap --stale`  |  one: `ve reap <name>`  |  "
-          "override gate: --force")
-
-
-def _reap_one(cfg: Config, w, envs: dict, dry_run: bool) -> bool:
-    from .worktrees import age_str
-
-    label = f"{w.path.name} [{w.state}] {w.branch} (last active {age_str(w.activity)})"
-    if dry_run:
-        say(f"would reap {label}")
-        return True
-    say(f"reaping {label}")
-    repo = Path(read_marker(w.path).get("repo", "")) if w.path.exists() else None
-    run(["git", "worktree", "remove", "--force", str(w.path)],
-        cwd=repo or Path.cwd(), check=False)
-    if w.path.exists():
-        shutil.rmtree(w.path, ignore_errors=True)
-    for name, path in envs.items():
-        if path.resolve() == w.path.resolve():
-            unregister_env(cfg, name)
-    run(["git", "worktree", "prune"], cwd=Path.cwd(), check=False)
-    return True
-
-
-def cmd_reap(cfg: Config, args) -> int:
-    from .worktrees import collect
-
-    repo = _reap_repo(cfg)
-    wts = collect(repo)
-    if not args.targets and not args.stale:
-        _print_worktrees(wts)
-        return 0
-
-    if args.stale:
-        selected = [w for w in wts if w.is_candidate]
-    else:
-        index: dict[str, object] = {}
-        for w in wts:
-            index[w.path.name] = w
-            index[str(w.path)] = w
-        selected = []
-        for t in args.targets:
-            w = index.get(t) or index.get(str(Path(t).expanduser().resolve()))
-            if w is None:
-                warn(f"no worktree matching '{t}'")
-            else:
-                selected.append(w)
-
-    envs = live_envs(cfg)
-    reaped = 0
-    for w in selected:
-        if not w.is_candidate and not args.force:
-            warn(f"skip {w.path.name} [{w.state}] — not a stale t3 worktree "
-                 "(active/primary/external); use --force to override")
-            continue
-        safe, reason = w.safety()
-        if not safe and not args.force:
-            warn(f"skip {w.path.name} — {reason}; commit/push or use --force")
-            continue
-        reaped += _reap_one(cfg, w, envs, dry_run=args.dry_run)
-    verb = "would reap" if args.dry_run else "reaped"
-    say(f"{verb} {reaped} worktree(s)")
-    return 0
-
-
-def cmd_status(cfg: Config, args) -> int:
-    root = _env_root_from_cwd()
-    m = read_marker(root)
-    platform = cfg.platform or detect_platform()
-    keys = venv_keys(root, platform, cfg.python,
-                     with_test=cfg.with_test, cap=cfg.cap)
-    bhash = build_key(root, platform, cfg.python, root / ".venv")
-    head = git(["rev-parse", "--short", "HEAD"], cwd=root)
-    overrides = user_overrides()
-    dirty = build_paths_dirty(root)
-
-    print(f"env:        {m.get('name', '?')} @ {head}  ({root})")
-    print(f"platform:   {platform} (python {cfg.python})")
-
-    def state(current: str | None, wanted: str) -> str:
-        return "OK" if current == wanted else f"STALE (have {current or 'none'})"
-
-    local_venv = root / ".venv"
-    local_state = state(m.get("venv_full_hash"), keys.full_hash)
-    if not local_venv.is_dir():
-        local_state = "MISSING (run `ve sync`)"
-    print(f"local venv: {local_state}")
-
-    def template_state(store: str, key: str) -> str:
-        entry = cfg.store(store) / key
-        if (entry / ".complete").exists():
-            return "HIT"
-        if entry.is_dir():
-            meta = read_meta(entry)
-            detail = meta.get("stage") or "previous construction did not finish"
-            return f"INCOMPLETE ({detail})"
-        return "MISS"
-
-    print(
-        f"venv base:  {keys.base_hash}  "
-        f"{template_state('venvs-base', keys.base_hash)}"
-    )
-    print(
-        f"venv full:  {keys.full_hash}  "
-        f"{template_state('venvs', keys.full_hash)}"
-    )
-    if cfg.with_test and keys.layout.test_files:
-        rel = keys.layout.test_files[0].relative_to(root)
-        print(f"test deps:  included ({rel})")
-    else:
-        print(f"test deps:  excluded ({'no test reqs found' if cfg.with_test else 'disabled'})")
-    build_state = state(m.get("build_hash") or None, bhash)
-    if m.get("attach_mode") == "local-build":
-        build_state = "private (dirty/override build)"
-    elif m.get("attach_mode") == "precompiled-fetch" and m.get("build_hash") == bhash:
-        cached_wheel = next((cfg.store("builds") / bhash).glob("vllm-*.whl"), None)
-        build_state = (
-            "OK (cached precompiled)" if cached_wheel is not None
-            else "OK (env-local precompiled fallback)"
-        )
-    print(f"build:      {bhash}  {build_state}")
-    if cfg.with_vllm_extras and platform == "cuda":
-        try:
-            wanted_extras = resolve_vllm_extras(root, keys.full_hash).key
-            print(
-                f"vLLM extras:{wanted_extras}  "
-                f"{state(m.get('vllm_extras_hash'), wanted_extras)}"
-            )
-        except RuntimeError:
-            print("vLLM extras: unsupported by this commit")
-    else:
-        print("vLLM extras: disabled")
-    if not keys.layout.recognized:
-        print("note:       unrecognized requirements layout — coarse hashing in effect")
-    if dirty:
-        print("dirty:      csrc/cmake working tree is dirty → private builds, no publish")
-    for var, val in overrides.items():
-        print(f"override:   build-layer caching DISABLED: {var}={val}")
-    return 0
-
-
-def cmd_gc(cfg: Config, args) -> int:
-    run_gc(cfg, dry_run=args.dry_run, free_gb=args.free)
-    return 0
-
-
-def _du_many(paths: list[Path]) -> dict[str, int]:
-    """Parallel `du -sB1` per path (hardlinks deduped within each path)."""
-    procs = {
-        str(p): subprocess.Popen(
-            ["du", "-sB1", str(p)],
-            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
-        )
-        for p in paths if p.is_dir()
-    }
-    out: dict[str, int] = {}
-    for key, proc in procs.items():
-        line, _ = proc.communicate()
-        try:
-            out[key] = int(line.split()[0])
-        except (IndexError, ValueError):
-            out[key] = 0
-    return out
-
-
-def _age(ts: float) -> str:
-    h = (time.time() - ts) / 3600
-    return f"{h:.1f}h" if h < 48 else f"{h / 24:.1f}d"
-
-
-def cmd_du(cfg: Config, args) -> int:
-    candidates = collect_candidates(cfg)
-    uv_dir = ccache_dir = None
-    p = run(["uv", "cache", "dir"], check=False)
-    if p.returncode == 0 and p.stdout.strip():
-        uv_dir = Path(p.stdout.strip())
-    p = run(["ccache", "--get-config", "cache_dir"], check=False)
-    if p.returncode == 0 and p.stdout.strip():
-        ccache_dir = Path(p.stdout.strip())
-
-    envs = live_envs(cfg)
-    say("measuring disk usage (reflink extent scan — may take a minute)...")
-    groups: dict[str, list[Path]] = {s: [cfg.store(s)] for s in STORE_NAMES}
-    scopes = {s: "stores" for s in STORE_NAMES}
-    for name, path in envs.items():
-        groups[f"env:{name}"] = [path / ".venv"]
-        scopes[f"env:{name}"] = "venvs"
-    usage = reflink_usage(groups, scopes)
-
-    if usage.supported:
-        logical = dict(usage.apparent)
-    else:  # non-reflink filesystem: fall back to plain du for apparent sizes
-        du = _du_many(
-            [cfg.store(s) for s in STORE_NAMES]
-            + [path / ".venv" for path in envs.values()]
-        )
-        logical = {s: du.get(str(cfg.store(s)), 0) for s in STORE_NAMES}
-        for name, path in envs.items():
-            logical[f"env:{name}"] = du.get(str(path / ".venv"), 0)
-
-    def row(name: str, entries: str, key: str) -> str:
-        line = f"  {name:18s} {entries:>7s} {human_size(logical.get(key, 0)):>10s}"
-        if usage.supported:
-            excl = usage.exclusive.get(key, 0)
-            line += f" {human_size(excl):>10s}"
-        return line
-
-    head = f"  {'':18s} {'entries':>7s} {'logical':>10s}"
-    if usage.supported:
-        head += f" {'delete frees':>10s}"
-
-    def subtotal(logical_sum: int, scope: str) -> None:
-        line = f"  {'subtotal':18s} {'':>7s} {human_size(logical_sum):>10s}"
-        if usage.supported:
-            freed = usage.exclusive_by_scope.get(scope, 0)
-            line += f" {human_size(freed):>10s}"
-        print(line)
-
-    print("stores")
-    print(head)
-    stores = sorted(STORE_NAMES, key=lambda s: -logical.get(s, 0))
-    store_total = 0
-    for store in stores:
-        n = sum(1 for c in candidates if c.store == store)
-        store_total += logical.get(store, 0)
-        note = (
-            "  (package data shared with uv cache)"
-            if store == "venvs-base"
-            else ""
-        )
-        print(row(store, str(n), store) + note)
-    subtotal(store_total, "stores")
-
-    if envs:
-        print("\nvenvs")
-        print(head)
-        env_total = 0
-        for name in sorted(envs):
-            env_total += logical.get(f"env:{name}", 0)
-            print(row(name, "", f"env:{name}"))
-        subtotal(env_total, "venvs")
-
-    if usage.supported:
-        # Assign store↔venv reflinks to stores so these two figures are
-        # non-overlapping and add exactly to the true on-disk total.
-        stores_phys = usage.unique_by_scope.get("stores", 0)
-        venvs_phys = usage.exclusive_by_scope.get("venvs", 0)
-        print("\nphysical (non-overlapping)")
-        print(f"  stores                         {human_size(stores_phys):>10s}")
-        print(f"  venvs                          {human_size(venvs_phys):>10s}")
-        print(f"  total                          {human_size(usage.unique_total):>10s}")
-        print(f"  store gc cap                   {cfg.max_size_gb:.1f}GB")
-
-    print()
-    cache_dirs = [d for d in (uv_dir, ccache_dir) if d is not None]
-    cache_du = _du_many(cache_dirs)
-    for label, d in (("uv cache", uv_dir), ("ccache", ccache_dir)):
-        if d is None:
-            print(f"{label:10s} {'—':>10s}  (not found)")
-        else:
-            note = "  (separate; reflink source)" if label == "uv cache" else ""
-            print(f"{label:10s} {human_size(cache_du.get(str(d), 0)):>10s}  {d}{note}")
-
-    p = run(["df", "-B1", "--output=avail", str(cfg.cache_dir)], check=False)
-    try:
-        avail = int(p.stdout.splitlines()[-1])
-        print(f"\ndisk free: {human_size(avail)} on {cfg.cache_dir}")
-    except (IndexError, ValueError):
-        pass
-    print("note: logical counts reflinked files in every venv; delete frees is the "
-          "space reclaimed by deleting that row/subtotal; physical assigns "
-          "store↔venv shared blocks to stores so stores + venvs = total")
-
-    if args.entries:
-        for store in STORE_NAMES:
-            cs = sorted(
-                (c for c in candidates if c.store == store),
-                key=lambda c: -c.size,
-            )
-            if not cs:
-                continue
-            print(f"\n== {store} ==")
-            for c in cs:
-                meta = read_meta(c.entry)
-                origin = meta.get("origin") or meta.get("base") or meta.get("kind", "")
-                prot = f"  [{c.protected}]" if c.protected else ""
-                print(f"{human_size(c.size):>10s}  {c.entry.name}  "
-                      f"last-used={_age(c.last_used)}  {origin}{prot}")
-    return 0
-
-
-def cmd_pin(cfg: Config, args) -> int:
-    store, _, name = args.entry.partition("/")
-    if store not in STORE_NAMES or not name:
-        die(f"expected <store>/<hash>, e.g. builds/abc123 (stores: {', '.join(STORE_NAMES)})")
-    entry = cfg.store(store) / name
-    if not entry.is_dir():
-        die(f"no such entry: {entry}")
-    meta = read_meta(entry)
-    meta["pinned"] = not args.unpin
-    write_meta(entry, meta)
-    say(f"{'unpinned' if args.unpin else 'pinned'} {store}/{name}")
-    return 0
-
-
-def cmd_hook(cfg: Config, args) -> int:
-    rest = args.rest
-    if args.event == "post-checkout":
-        old, new, flag = (rest + ["", "", ""])[:3]
-        return handle_post_checkout(cfg, old, new, flag)
-    if args.event == "post-commit":
-        return handle_post_commit(cfg)
-    if args.event == "post-rewrite":
-        return handle_post_rewrite(cfg, rest[0] if rest else "")
-    return 0
+from . import errorlog
+from .commands import cache, diagnostics, envs, errors, hook, reap
+from .commands import drift as drift_cmd
+from .config import STORE_NAMES, load_config
+from .log import warn
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -533,87 +20,166 @@ def main(argv: list[str] | None = None) -> int:
     sp.add_argument("ref")
     sp.add_argument("--name", "-n")
     sp.add_argument("--repo", help="path to the vLLM clone (default: cwd)")
-    sp.set_defaults(func=cmd_new)
+    sp.set_defaults(func=envs.cmd_new)
 
     sp = sub.add_parser(
         "init", help="manage the current checkout/worktree in place (build + venv)"
     )
     sp.add_argument("--name", "-n", help="env name (default: directory name)")
-    sp.set_defaults(func=cmd_init)
+    sp.set_defaults(func=envs.cmd_init)
 
     sp = sub.add_parser(
         "activate",
         help="activate the env venv in the current shell "
              "(needs eval \"$(ve shellenv)\" in your rc)",
     )
-    sp.set_defaults(func=cmd_activate)
+    sp.set_defaults(func=envs.cmd_activate)
 
     sp = sub.add_parser(
         "shellenv",
         help="print shell function enabling `ve activate`; "
              "add to your rc: eval \"$(ve shellenv)\"",
     )
-    sp.set_defaults(func=cmd_shellenv)
+    sp.set_defaults(func=envs.cmd_shellenv)
 
     sp = sub.add_parser("sync", help="re-resolve layers for the current worktree HEAD")
     sp.add_argument("--fresh-venv", action="store_true",
                     help="discard env venv divergence, re-clone from template")
-    sp.set_defaults(func=cmd_sync)
+    sp.set_defaults(func=envs.cmd_sync)
 
     sp = sub.add_parser("rm", help="remove an env (never shared caches)")
     sp.add_argument("name")
-    sp.set_defaults(func=cmd_rm)
+    sp.add_argument("--force", action="store_true",
+                    help="remove a `ve new` env even with uncommitted/unpushed work")
+    sp.set_defaults(func=envs.cmd_rm)
 
     sp = sub.add_parser("list", help="list envs")
-    sp.set_defaults(func=cmd_list)
+    sp.set_defaults(func=envs.cmd_list)
 
     sp = sub.add_parser("status", help="show env layer hashes and cache state")
-    sp.set_defaults(func=cmd_status)
+    sp.set_defaults(func=envs.cmd_status)
 
     sp = sub.add_parser(
         "reap",
-        help="list worktrees; reap stale (archived/deleted) t3code ones",
+        help="list worktrees; reap ones inactive for longer than a cutoff",
     )
     sp.add_argument("targets", nargs="*", help="worktree name(s) or path(s) to reap")
     sp.add_argument("--stale", action="store_true",
-                    help="reap all archived/deleted/orphan worktrees")
+                    help="reap all stale worktrees that pass the safety gate")
+    sp.add_argument("--older-than", type=float, metavar="DAYS",
+                    help="staleness cutoff in days (default: [reap] max_age_days "
+                         "in config.toml, VE_REAP_MAX_AGE_DAYS, or 30)")
     sp.add_argument("--force", action="store_true",
                     help="bypass the clean+pushed safety gate")
     sp.add_argument("--dry-run", action="store_true", help="show what would be reaped")
-    sp.set_defaults(func=cmd_reap)
+    sp.set_defaults(func=reap.cmd_reap)
 
     sp = sub.add_parser("gc", help="prune caches (LRU, 100GB default cap)")
     sp.add_argument("--dry-run", action="store_true")
     sp.add_argument("--free", type=float, metavar="GB",
                     help="evict until this many GB are reclaimed")
-    sp.set_defaults(func=cmd_gc)
+    sp.set_defaults(func=cache.cmd_gc)
 
     sp = sub.add_parser(
         "du", help="cache usage audit: per store, uv cache/ccache, live envs"
     )
     sp.add_argument("--entries", "-e", action="store_true",
                     help="also list per-entry sizes with age and origin")
-    sp.set_defaults(func=cmd_du)
+    sp.set_defaults(func=cache.cmd_du)
+
+    sp = sub.add_parser(
+        "drift",
+        help="packages/files changed by hand in env venvs since ve set them up",
+    )
+    sp.add_argument("env", nargs="?",
+                    help="env name or path for details (default: table of all envs)")
+    sp.add_argument("--all-envs", action="store_true",
+                    help="include envs without drift in the table")
+    sp.add_argument("--record", action="store_true",
+                    help="also record drift in the incident log (`ve errors`)")
+    sp.add_argument("--json", action="store_true")
+    sp.set_defaults(func=drift_cmd.cmd_drift)
+
+    sp = sub.add_parser(
+        "precompiled",
+        help="show which upstream wheel matches this worktree's compiled sources "
+             "(read-only, no download)",
+    )
+    sp.add_argument("path", nargs="?", help="worktree (default: cwd)")
+    sp.add_argument("--json", action="store_true")
+    sp.set_defaults(func=diagnostics.cmd_precompiled)
+
+    sp = sub.add_parser(
+        "rules",
+        help="explain this worktree's vLLM-version facts and which rules fire "
+             "(read-only)",
+    )
+    sp.add_argument("path", nargs="?", help="worktree (default: cwd)")
+    sp.add_argument("--json", action="store_true")
+    sp.set_defaults(func=diagnostics.cmd_rules)
 
     sp = sub.add_parser("pin", help="pin/unpin a store entry (exempt from gc)")
     sp.add_argument("entry", help="<store>/<hash>")
     sp.add_argument("--unpin", action="store_true")
-    sp.set_defaults(func=cmd_pin)
+    sp.set_defaults(func=cache.cmd_pin)
+
+    sp = sub.add_parser(
+        "errors",
+        help="local incident log: recurring ve failures/fallbacks and agent notes",
+    )
+    esub = sp.add_subparsers(dest="errors_cmd")
+    sp.set_defaults(func=errors.cmd_errors_summary, days=30.0, level="all", json=False)
+    sp.add_argument("--days", type=float, default=30.0)
+    sp.add_argument("--level", choices=("all", "error", "warning", "drift"), default="all")
+    sp.add_argument("--json", action="store_true")
+
+    ep = esub.add_parser("list", help="individual incidents, newest last")
+    ep.add_argument("--days", type=float, default=30.0)
+    ep.add_argument("--limit", type=int, default=50)
+    ep.add_argument("--json", action="store_true")
+    ep.set_defaults(func=errors.cmd_errors_list)
+
+    ep = esub.add_parser("show", help="details for an incident id or fingerprint")
+    ep.add_argument("key")
+    ep.add_argument("--limit", type=int, default=3)
+    ep.add_argument("--traceback", "-t", action="store_true")
+    ep.add_argument("--tail", type=int, default=40, metavar="N",
+                    help="lines of the stored output tail to print")
+    ep.add_argument("--full", action="store_true",
+                    help="print the complete saved output of the failed command")
+    ep.add_argument("--json", action="store_true")
+    ep.set_defaults(func=errors.cmd_errors_show)
+
+    ep = esub.add_parser(
+        "note",
+        help="record what you did about an incident (default: latest error "
+             "in this repo, else latest warning)",
+    )
+    ep.add_argument("message")
+    ep.add_argument("--ref", help="incident id or fingerprint to attach to")
+    ep.set_defaults(func=errors.cmd_errors_note)
 
     sp = sub.add_parser("hook", help=argparse.SUPPRESS)
     sp.add_argument("event")
     sp.add_argument("rest", nargs="*")
-    sp.set_defaults(func=cmd_hook)
+    sp.set_defaults(func=hook.cmd_hook)
 
     args = p.parse_args(argv)
     cfg = load_config()
+    errorlog.configure(
+        None if args.cmd == "errors" else cfg.cache_dir,
+        ["ve", *(sys.argv[1:] if argv is None else argv)],
+    )
     for store in STORE_NAMES:
         cfg.store(store).mkdir(parents=True, exist_ok=True)
     try:
         return args.func(cfg, args)
     except KeyboardInterrupt:
-        warn("interrupted")
+        warn("interrupted", log=False)
         return 130
+    except Exception as e:
+        errorlog.record("error", f"unhandled {type(e).__name__}: {e}", e)
+        raise
 
 
 if __name__ == "__main__":

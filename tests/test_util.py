@@ -1,11 +1,14 @@
 import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from vllm_envs.util import _reflink_support, reflink_clone
+from vllm_envs.util import (
+    _reflink_support, age_str, atomic_write_text, reflink_clone,
+)
 
 
 class ReflinkCloneTest(unittest.TestCase):
@@ -83,6 +86,21 @@ class ReflinkCloneTest(unittest.TestCase):
 
         self.assertEqual(calls, 3)
         self.assertFalse(dst.exists())
+
+
+class SmallHelpersTest(unittest.TestCase):
+    def test_atomic_write_applies_mode_before_rename(self):
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        target = root / "hook"
+        atomic_write_text(target, "#!/bin/sh\n", mode=0o755)
+        self.assertEqual(target.stat().st_mode & 0o777, 0o755)
+        self.assertEqual([p.name for p in root.iterdir()], ["hook"])
+
+    def test_age_str(self):
+        now = time.time()
+        self.assertEqual(age_str(None), "?")
+        self.assertEqual(age_str(now - 3 * 3600), "3h")
+        self.assertEqual(age_str(now - 3 * 86400, digits=1), "3.0d")
 
 
 if __name__ == "__main__":

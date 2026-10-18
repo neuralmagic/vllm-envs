@@ -2,7 +2,7 @@ import json
 import time
 from pathlib import Path
 
-from .util import apportioned_size_bytes, dir_size_bytes
+from .util import apportioned_size_bytes, atomic_write_text, dir_size_bytes
 
 META_NAME = "meta.json"
 LAST_USED_NAME = ".last-used"
@@ -13,7 +13,7 @@ def write_meta(entry: Path, data: dict) -> None:
     data.setdefault("created_at", time.time())
     if "size_bytes" not in data:
         data["size_bytes"] = dir_size_bytes(entry)
-    (entry / META_NAME).write_text(json.dumps(data, indent=2))
+    atomic_write_text(entry / META_NAME, json.dumps(data, indent=2))
 
 
 def read_meta(entry: Path) -> dict:

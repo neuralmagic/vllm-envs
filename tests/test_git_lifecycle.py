@@ -1,3 +1,5 @@
+import contextlib
+import io
 import json
 import os
 import subprocess
@@ -132,6 +134,92 @@ class GitLifecycleIntegrationTest(unittest.TestCase):
         })
         marker = (self.worktree / MARKER_NAME).read_text()
         self.assertIn(f'synced_head = "{self.initial_head}"', marker)
+
+    def commit_requirements(self, cwd: Path, version: int) -> str:
+        (cwd / "requirements" / "common.txt").write_text(f"example=={version}\n")
+        self.git(cwd, "commit", "-qam", f"requirements v{version}")
+        return self.head(cwd)
+
+    def test_every_bisect_checkout_syncs_the_env(self):
+        self.git(self.repo, "worktree", "add", "-b", "feature", str(self.worktree))
+        middle = self.commit_requirements(self.worktree, 2)
+        tip = self.commit_requirements(self.worktree, 3)
+
+        self.git(self.worktree, "bisect", "start", tip, self.initial_head)
+        self.assertEqual(self.syncs()[-1]["head"], middle)
+        self.git(self.worktree, "bisect", "reset")
+        self.assertEqual(self.syncs()[-1]["head"], tip)
+
+    def test_merge_of_requirements_change_syncs_the_env(self):
+        self.git(self.repo, "worktree", "add", "-b", "feature", str(self.worktree))
+        self.git(self.repo, "checkout", "-q", "-b", "upstream")
+        merged = self.commit_requirements(self.repo, 5)
+        self.git(self.repo, "checkout", "-q", "main")
+        before = len(self.syncs())
+
+        self.git(self.worktree, "merge", "-q", "--ff-only", "upstream")
+
+        self.assertEqual(len(self.syncs()), before + 1)
+        self.assertEqual(self.syncs()[-1]["head"], merged)
+
+    def test_chained_post_rewrite_hook_and_ve_both_get_stdin(self):
+        hooks = Path(self.git(self.repo, "rev-parse", "--git-path", "hooks").stdout.strip())
+        hooks = hooks if hooks.is_absolute() else self.repo / hooks
+        seen = self.root / "chained-stdin"
+        chained = hooks / "post-rewrite.pre-ve"
+        chained.write_text(f"#!/bin/sh\ncat > {seen}\n")
+        chained.chmod(0o755)
+        self.git(self.repo, "worktree", "add", "-b", "feature", str(self.worktree))
+        self.commit_requirements(self.worktree, 2)
+        before = len(self.syncs())
+
+        (self.worktree / "requirements" / "common.txt").write_text("example==9\n")
+        self.git(self.worktree, "commit", "-qa", "--amend", "--no-edit")
+
+        self.assertTrue(seen.read_text().strip())
+        self.assertGreater(len(self.syncs()), before)
+
+    def test_hooks_install_into_core_hooks_path(self):
+        custom = self.root / "custom-hooks"
+        self.git(self.repo, "config", "core.hooksPath", str(custom))
+        install_hook(self.repo)
+        self.assertTrue((custom / "post-checkout").exists())
+        self.assertTrue((custom / "post-merge").exists())
+
+    def test_rm_never_deletes_an_auto_initialized_worktree(self):
+        from vllm_envs.cli import main
+        from vllm_envs.registry import read_marker
+
+        self.git(self.repo, "worktree", "add", "-b", "feature", str(self.worktree))
+        (self.worktree / "wip.py").write_text("unsaved = True\n")
+        name = read_marker(self.worktree)["name"]
+        self.assertEqual(read_marker(self.worktree)["origin"], "auto")
+
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(main(["rm", name]), 0)
+
+        self.assertTrue((self.worktree / "wip.py").exists())
+        self.assertFalse((self.worktree / MARKER_NAME).exists())
+
+    def test_rm_of_ve_new_env_requires_force_when_dirty(self):
+        from vllm_envs.cli import main
+        from vllm_envs.config import load_config
+        from vllm_envs.registry import register_env, write_marker
+
+        envs_root = self.root / "envs"
+        envs_root.mkdir()
+        dest = envs_root / "scratch"
+        self.git(self.repo, "worktree", "add", "--detach", str(dest))
+        write_marker(dest, {"name": "scratch", "repo": str(self.repo), "origin": "new"})
+        (dest / "wip.py").write_text("unsaved = True\n")
+        with patch.dict(os.environ, {"VE_ENVS_ROOT": str(envs_root)}):
+            register_env(load_config(), "scratch", dest, self.repo)
+            with contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit):
+                    main(["rm", "scratch"])
+                self.assertTrue((dest / "wip.py").exists())
+                self.assertEqual(main(["rm", "scratch", "--force"]), 0)
+        self.assertFalse(dest.exists())
 
 
 if __name__ == "__main__":

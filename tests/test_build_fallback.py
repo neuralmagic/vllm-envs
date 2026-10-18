@@ -4,7 +4,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 from vllm_envs.config import Config
-from vllm_envs.layers import BuildResolution, attach, resolve_build
+from vllm_envs.attach import attach
+from vllm_envs.buildlayer import BuildResolution, resolve_build
 from vllm_envs.registry import read_marker, write_marker
 
 
@@ -21,11 +22,11 @@ class PrecompiledFallbackIntegrationTest(unittest.TestCase):
         )
 
         with (
-            patch("vllm_envs.layers.build_key", return_value="build-key"),
-            patch("vllm_envs.layers.build_paths_dirty", return_value=False),
-            patch("vllm_envs.layers.user_overrides", return_value={}),
-            patch("vllm_envs.layers.try_fetch_precompiled", return_value=None),
-            patch("vllm_envs.layers.editable.editable_present", return_value=True),
+            patch("vllm_envs.buildlayer.build_key", return_value="build-key"),
+            patch("vllm_envs.buildlayer.build_paths_dirty", return_value=False),
+            patch("vllm_envs.buildlayer.user_overrides", return_value={}),
+            patch("vllm_envs.buildlayer.try_fetch_precompiled", return_value=None),
+            patch("vllm_envs.buildlayer.editable.editable_present", return_value=True),
         ):
             resolution = resolve_build(Config(cache_dir=root / "cache"), root, venv)
 
@@ -43,7 +44,7 @@ class PrecompiledFallbackIntegrationTest(unittest.TestCase):
             "precompiled-fetch", None, "build-key", shared=False
         )
 
-        with patch("vllm_envs.layers._uv_pip"):
+        with patch("vllm_envs.attach.uv_pip_install"):
             attach(Config(), root, venv, resolution)
 
         marker = read_marker(root)

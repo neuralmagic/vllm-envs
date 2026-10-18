@@ -17,7 +17,15 @@ from vllm_envs.deepep import (
     sync_deepep,
 )
 from vllm_envs.registry import read_marker, write_marker
+from vllm_envs.rules import RULES
 from vllm_envs.store import read_meta
+
+
+def rule_effects(rule_id: str) -> tuple:
+    return next(r for r in RULES if r.id == rule_id).then
+
+
+NCCL_OVERRIDES = tuple(e.spec for e in rule_effects("deepep-nccl-override"))
 
 
 INSTALLER = """\
@@ -42,7 +50,7 @@ class DeepEPResolutionTest(unittest.TestCase):
         installer.write_text(INSTALLER)
         return root
 
-    def test_uses_centralized_docker_pin_and_installer_nvshmem_default(self):
+    def test_uses_centralized_docker_pin(self):
         root = self.make_root()
         versions = root / "docker" / "versions.json"
         versions.parent.mkdir()
@@ -53,13 +61,28 @@ class DeepEPResolutionTest(unittest.TestCase):
         resolution = resolve(root, "venv-hash")
 
         self.assertEqual(resolution.ref, "docker-ref")
-        self.assertEqual(resolution.nvshmem_version, "3.3.24")
 
     def test_uses_docker_deepep_architectures(self):
         root = self.make_root()
         dockerfile = root / "docker" / "Dockerfile"
         dockerfile.parent.mkdir()
         dockerfile.write_text("export TORCH_CUDA_ARCH_LIST='9.0a 10.0a'\n")
+
+        resolution = resolve(root, "venv-hash")
+
+        self.assertEqual(resolution.cuda_arch_list, "9.0a 10.0a")
+
+    def test_resolves_variable_indirected_docker_architectures(self):
+        root = self.make_root()
+        dockerfile = root / "docker" / "Dockerfile"
+        dockerfile.parent.mkdir()
+        dockerfile.write_text(
+            "    DEEPEP_ARCH_LIST='9.0a 10.0a' && \\\n"
+            "    if [ ... ]; then \\\n"
+            '        DEEPEP_ARCH_LIST="$DEEPEP_ARCH_LIST 10.3a"; \\\n'
+            "    fi && \\\n"
+            '    export TORCH_CUDA_ARCH_LIST="$DEEPEP_ARCH_LIST" && \\\n'
+        )
 
         resolution = resolve(root, "venv-hash")
 
@@ -83,6 +106,24 @@ class DeepEPResolutionTest(unittest.TestCase):
         resolution = resolve(root, "venv-hash")
 
         self.assertEqual(resolution.cuda_arch_list, "9.0a 10.0a 10.3a")
+
+    def test_resolution_carries_fired_rule_effects(self):
+        root = self.make_root()
+        installer = root / "tools" / "ep_kernels" / "install_python_libraries.sh"
+        installer.write_text(INSTALLER + 'PPLX_COMMIT_HASH=${PPLX_COMMIT_HASH:-"12cecfd"}\n')
+        before = resolve(root, "venv-hash")
+        versions = root / "docker" / "versions.json"
+        versions.parent.mkdir()
+        versions.write_text(
+            json.dumps({"variable": {"NCCL_VERSION": {"default": "2.30.7"}}})
+        )
+
+        after = resolve(root, "venv-hash")
+
+        self.assertEqual(before.pplx_ref, "12cecfd")
+        self.assertEqual(before.patches, rule_effects("pplx-with-tests-flag"))
+        self.assertEqual(before.overrides, ())
+        self.assertEqual(after.overrides, NCCL_OVERRIDES)
 
     def test_falls_back_to_installer_pin(self):
         root = self.make_root()
@@ -135,8 +176,36 @@ class DeepEPResolutionTest(unittest.TestCase):
     def test_commit_before_ep_installer_is_skipped(self):
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))
 
-        with patch("vllm_envs.deepep.resolve") as resolve_mock:
+        with patch("vllm_envs.deepep.run") as run_mock:
             sync_deepep(Config(), root, root / ".venv", "venv-hash")
+
+        run_mock.assert_not_called()
+
+    def test_installer_without_pinned_ref_is_skipped_not_fatal(self):
+        # 2025-05..2025-11: the installer existed but pinned no DeepEP ref
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        installer = root / "tools" / "ep_kernels" / "install_python_libraries.sh"
+        installer.parent.mkdir(parents=True)
+        installer.write_text("set -ex\npip3 install cmake torch ninja\n")
+
+        with patch("vllm_envs.deepep.run") as run_mock:
+            sync_deepep(Config(), root, root / ".venv", "venv-hash")
+
+        run_mock.assert_not_called()
+
+    def test_toolkit_cuda_major_mismatching_torch_is_skipped(self):
+        # 2025-12 commit pins torch cu129; the host only has CUDA 13.0.
+        root = self.make_root()
+        venv = root / ".venv"
+        (venv / "lib" / "python3.12" / "site-packages"
+         / "torch-2.9.0+cu129.dist-info").mkdir(parents=True)
+
+        with (
+            patch("vllm_envs.deepep._toolkit_cuda_major",
+                  return_value=(Path("/usr/local/cuda"), "13")),
+            patch("vllm_envs.deepep.resolve") as resolve_mock,
+        ):
+            sync_deepep(Config(), root, venv, "venv-hash")
 
         resolve_mock.assert_not_called()
 
@@ -149,7 +218,8 @@ class DeepEPLayerIntegrationTest(unittest.TestCase):
             'PPLX_COMMIT_HASH=${PPLX_COMMIT_HASH:-"12cecfd"}\n'
         )
         resolution = DeepEPResolution(
-            "key", "73b6ea4", "3.3.24", "10.3a", installer
+            "key", "73b6ea4", "10.3a", installer,
+            pplx_ref="12cecfd", patches=rule_effects("pplx-with-tests-flag"),
         )
 
         def fake_fetch(repo, ref, dest, label):
@@ -212,6 +282,8 @@ class DeepEPLayerIntegrationTest(unittest.TestCase):
         with (
             patch("vllm_envs.deepep.run", side_effect=fake_run),
             patch("vllm_envs.deepep.cuda_version", return_value="12.9"),
+            patch("vllm_envs.deepep._toolkit_cuda_major",
+                  return_value=(Path("/usr/local/cuda"), None)),
             patch("vllm_envs.deepep._prepare_sources"),
         ):
             sync_deepep(cfg, checkout, venv, "venv-hash")
@@ -248,39 +320,41 @@ class NcclOverrideTest(unittest.TestCase):
         self.resolution = DeepEPResolution(
             key="key",
             ref="ref",
-            nvshmem_version="3.3.24",
             cuda_arch_list="",
             installer=self.root / "installer.sh",
             nccl_version="2.30.7",
+            overrides=NCCL_OVERRIDES,
         )
 
+    def install_nccl(self, dist: str) -> None:
+        site = self.venv / "lib" / "python3.12" / "site-packages"
+        (site / dist).mkdir(parents=True)
+
     def test_writes_override_pinning_the_docker_nccl(self):
-        with patch(
-            "vllm_envs.deepep.run",
-            return_value=SimpleNamespace(returncode=0, stdout="Version: 2.29.7\n"),
-        ):
-            override = _nccl_override(self.venv, self.resolution, self.dest)
+        self.install_nccl("nvidia_nccl_cu13-2.29.7.dist-info")
+
+        override = _nccl_override(self.venv, self.resolution, self.dest)
 
         self.assertEqual(override, str(self.dest))
         self.assertEqual(self.dest.read_text(), "nvidia-nccl-cu13==2.30.7\n")
 
+    def test_override_follows_the_venv_cuda_major(self):
+        self.install_nccl("nvidia_nccl_cu12-2.27.3.dist-info")
+
+        _nccl_override(self.venv, self.resolution, self.dest)
+
+        self.assertEqual(self.dest.read_text(), "nvidia-nccl-cu12==2.30.7\n")
+
     def test_writes_override_even_when_already_installed(self):
         # torch's exact pin can still pull it back down mid-install.
-        with patch(
-            "vllm_envs.deepep.run",
-            return_value=SimpleNamespace(returncode=0, stdout="Version: 2.30.7\n"),
-        ):
-            override = _nccl_override(self.venv, self.resolution, self.dest)
+        self.install_nccl("nvidia_nccl_cu13-2.30.7.dist-info")
+
+        override = _nccl_override(self.venv, self.resolution, self.dest)
 
         self.assertEqual(override, str(self.dest))
 
     def test_no_override_without_an_nccl_wheel_in_the_venv(self):
-        with patch(
-            "vllm_envs.deepep.run",
-            return_value=SimpleNamespace(returncode=1, stdout=""),
-        ):
-            self.assertIsNone(_nccl_override(self.venv, self.resolution, self.dest))
-
+        self.assertIsNone(_nccl_override(self.venv, self.resolution, self.dest))
         self.assertFalse(self.dest.exists())
 
     def test_nccl_lib_dir_comes_from_the_venv_wheel(self):
@@ -301,14 +375,14 @@ class NcclOverrideTest(unittest.TestCase):
             self.assertEqual(_nccl_lib_dir(self.venv), "")
 
     def test_no_override_without_a_docker_pin(self):
+        self.install_nccl("nvidia_nccl_cu13-2.29.7.dist-info")
         with patch("vllm_envs.deepep.run") as run_mock:
             override = _nccl_override(
                 self.venv,
                 DeepEPResolution(
                     key="key",
                     ref="ref",
-                    nvshmem_version="3.3.24",
-                    cuda_arch_list="",
+                            cuda_arch_list="",
                     installer=self.resolution.installer,
                 ),
                 self.dest,

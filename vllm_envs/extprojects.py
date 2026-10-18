@@ -23,7 +23,9 @@ from .log import say, warn
 from .store import touch_last_used, write_meta
 from .util import run
 
-SET_RE = re.compile(r'set\s*\(\s*([A-Za-z0-9_]+)\s+"?([^")\s]+)"?\s*\)', re.I)
+SET_RE = re.compile(
+    r'set\s*\(\s*([A-Za-z0-9_]+)\s+"?([^")\s]+)"?(?:\s+CACHE\b[^)]*)?\s*\)', re.I
+)
 COMMENT_RE = re.compile(r"#[^\n]*")
 DECLARE_RE = re.compile(
     r"FetchContent_(?:Declare|Populate)\s*\(\s*([A-Za-z0-9_\-]+)(.*?)\)", re.I | re.S
@@ -68,15 +70,73 @@ class ExtPin:
     subdir: str = ""
 
 
-def _resolve(value: str, variables: dict[str, str]) -> str | None:
+def _resolve(value: str, variables: dict[str, set[str]]) -> str | None:
+    """Substitute ${VAR}s; None when a variable is undefined or set to
+    different values (e.g. in if/else branches): we cannot know which one
+    CMake will use, so leave that project to vLLM's own FetchContent."""
+    unknown = False
+
     def repl(m: re.Match) -> str:
-        return variables.get(m.group(1), "")
+        nonlocal unknown
+        values = variables.get(m.group(1), set())
+        if len(values) != 1:
+            unknown = True
+            return ""
+        return next(iter(values))
 
     resolved = re.sub(r"\$\{([A-Za-z0-9_]+)\}", repl, value).strip()
-    return resolved or None
+    return None if unknown or not resolved else resolved
 
 
-def parse_pins(root: Path) -> dict[str, ExtPin]:
+_BRANCH_RE = re.compile(r"\b(if|elseif|else|endif)\s*\(([^)]*)\)", re.I)
+_PLATFORM_COND_RE = re.compile(
+    r'^\s*(VLLM_TARGET_DEVICE|VLLM_GPU_LANG)\s+STREQUAL\s+"?(\w+)"?\s*$', re.I
+)
+_GPU_LANG = {"cuda": "CUDA", "rocm": "HIP"}
+
+
+def _platform_cond(cond: str, platform: str) -> bool | None:
+    """Truth of a platform test (the common way vLLM's cmake picks per-device
+    pins); None for anything else."""
+    m = _PLATFORM_COND_RE.match(cond)
+    if not m:
+        return None
+    actual = platform if m.group(1).upper() == "VLLM_TARGET_DEVICE" else _GPU_LANG.get(platform)
+    return (actual or "").lower() == m.group(2).lower()
+
+
+def _possible_sets(text: str, platform: str) -> dict[str, set[str]]:
+    """Values each variable may hold, dropping set()s inside branches that are
+    certainly not taken on this platform."""
+    events = sorted(
+        [(m.start(), "branch", m) for m in _BRANCH_RE.finditer(text)]
+        + [(m.start(), "set", m) for m in SET_RE.finditer(text)],
+        key=lambda e: e[0],
+    )
+    # per open if(): [truth of current branch, any earlier branch certainly taken]
+    stack: list[list] = []
+    out: dict[str, set[str]] = {}
+    for _, kind, m in events:
+        if kind == "branch":
+            word, cond = m.group(1).lower(), m.group(2)
+            if word == "if":
+                stack.append([_platform_cond(cond, platform), False])
+            elif word in ("elseif", "else") and stack:
+                frame = stack[-1]
+                frame[1] = frame[1] or frame[0] is True
+                frame[0] = False if frame[1] else (
+                    _platform_cond(cond, platform) if word == "elseif" else
+                    (None if frame[0] is None else True))
+            elif word == "endif" and stack:
+                stack.pop()
+            continue
+        if any(frame[0] is False for frame in stack):
+            continue
+        out.setdefault(m.group(1), set()).add(m.group(2))
+    return out
+
+
+def parse_pins(root: Path, platform: str = "cuda") -> dict[str, ExtPin]:
     """Parse external project pins from the worktree's cmake files."""
     files = [root / "CMakeLists.txt"]
     ext_dir = root / "cmake" / "external_projects"
@@ -88,7 +148,7 @@ def parse_pins(root: Path) -> dict[str, ExtPin]:
         if not f.is_file():
             continue
         text = COMMENT_RE.sub("", f.read_text(errors="replace"))
-        variables = {m.group(1): m.group(2) for m in SET_RE.finditer(text)}
+        variables = _possible_sets(text, platform)
         for m in DECLARE_RE.finditer(text):
             name, body = m.group(1).lower(), m.group(2)
             fields = {k: v for k, v in FIELD_RE.findall(body)}
@@ -270,7 +330,7 @@ def user_overrides() -> dict[str, str]:
 def src_dir_env(cfg: Config, root: Path) -> dict[str, str]:
     """Env vars mapping parsed pins to shared read-only source checkouts."""
     env: dict[str, str] = {}
-    pins = parse_pins(root)
+    pins = parse_pins(root, cfg.platform or "cuda")
     for name, var in EXT_PROJECT_ENV_VARS.items():
         if os.environ.get(var):
             continue  # user override wins (handled as unpinned elsewhere)

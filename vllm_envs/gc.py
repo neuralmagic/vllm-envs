@@ -1,6 +1,8 @@
 """LRU garbage collection across the content-addressed stores."""
 
+import os
 import shutil
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -12,6 +14,9 @@ from .log import say, warn
 from .registry import referenced_build_hashes, referenced_deepep_hashes
 from .store import entry_size, is_pinned, last_used
 from .util import human_size, run
+
+
+TOMBSTONE = ".evicting-"
 
 
 @dataclass
@@ -34,7 +39,7 @@ def collect_candidates(cfg: Config) -> list[Candidate]:
         if not base.is_dir():
             continue
         for entry in sorted(base.iterdir()):
-            if not entry.is_dir():
+            if not entry.is_dir() or entry.name.startswith("."):
                 continue
             lu = last_used(entry)
             protected = ""
@@ -66,12 +71,33 @@ def _evict(c: Candidate, dry_run: bool) -> bool:
         return False
     try:
         say(f"evicting {label}")
-        shutil.rmtree(c.entry, ignore_errors=True)
-        lock_file = c.entry.parent / (c.entry.name + ".lock")
-        lock_file.unlink(missing_ok=True)
+        # Rename first: a deletion cut short must not leave a half-deleted
+        # entry (e.g. a venv template still carrying .complete) under its name.
+        tomb = c.entry.parent / f".{c.entry.name}{TOMBSTONE}{os.getpid()}"
+        os.rename(c.entry, tomb)
+        shutil.rmtree(tomb, ignore_errors=True)
+        # The .lock file stays: unlinking it would let a waiter (holding the
+        # old inode) and a newcomer (a fresh file) both "own" the entry.
         return True
     finally:
         release(fd)
+
+
+def sweep_tombstones(cfg: Config) -> None:
+    """Finish evictions interrupted after their rename, and drop output
+    spools (util.run) left in the temp dir by killed ve processes."""
+    for store in EVICTION_ORDER:
+        base = cfg.store(store)
+        if base.is_dir():
+            for tomb in base.glob(f".*{TOMBSTONE}*"):
+                shutil.rmtree(tomb, ignore_errors=True)
+    cutoff = time.time() - 86400
+    for spool in Path(tempfile.gettempdir()).glob("ve-output-*.log"):
+        try:
+            if spool.stat().st_mtime < cutoff:
+                spool.unlink()
+        except OSError:
+            pass
 
 
 def _prune_uv_cache(dry_run: bool) -> None:
@@ -91,6 +117,8 @@ def run_gc(
     dry_run: bool = False,
     free_gb: float | None = None,
 ) -> None:
+    if not dry_run:
+        sweep_tombstones(cfg)
     candidates = collect_candidates(cfg)
 
     # Enforce the cap on real on-disk size: stores are heavily reflinked, so the

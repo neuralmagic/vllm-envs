@@ -8,13 +8,16 @@ import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
+from . import rules
 from .config import Config
 from .extprojects import fetch_ref
-from .hashing import cuda_version
+from .hashing import cuda_version, file_sha256
 from .locks import entry_lock
 from .log import say
 from .registry import read_marker, update_marker
+from .sitepkgs import dist_infos, dists_installed, torch_cuda_major
 from .store import touch_last_used, write_meta
+from .treefacts import TreeFacts, facts_for
 from .util import run
 
 
@@ -22,42 +25,19 @@ from .util import run
 class DeepEPResolution:
     key: str
     ref: str
-    nvshmem_version: str
     cuda_arch_list: str
     installer: Path
     nccl_version: str = ""
+    pplx_ref: str = ""
+    # Fired rules' effects (rules.OverrideReq / rules.PatchSource, layer "ep").
+    overrides: tuple[str, ...] = ()
+    patches: tuple = ()
 
 
-def _shell_default(script: str, name: str) -> str:
-    pattern = rf'^{name}=\$\{{{name}:-["\']?([^"\'}} ]+)["\']?\}}'
-    match = re.search(pattern, script, re.MULTILINE)
-    if match is None:
-        raise RuntimeError(f"vLLM EP installer has no {name} default")
-    return match.group(1)
-
-
-def _docker_variable(root: Path, name: str) -> str | None:
-    versions = root / "docker" / "versions.json"
-    try:
-        value = json.loads(versions.read_text())["variable"][name]["default"]
-    except (OSError, KeyError, TypeError, json.JSONDecodeError):
-        return None
-    return str(value)
-
-
-def _docker_cuda_arch_list(root: Path) -> str:
-    try:
-        dockerfile = (root / "docker" / "Dockerfile").read_text()
-    except OSError:
-        return ""
-    match = re.search(r"export TORCH_CUDA_ARCH_LIST=['\"]([^'\"]+)", dockerfile)
-    return match.group(1) if match else ""
-
-
-def _cuda_arch_list(root: Path) -> str:
+def _cuda_arch_list(facts: TreeFacts) -> str:
     if override := os.environ.get("TORCH_CUDA_ARCH_LIST"):
         return override
-    archs = _docker_cuda_arch_list(root).split()
+    archs = facts.docker_cuda_arch_list.split()
     proc = run(
         ["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader"],
         check=False,
@@ -71,32 +51,36 @@ def _cuda_arch_list(root: Path) -> str:
     return " ".join(archs)
 
 
-def resolve(root: Path, venv_hash: str) -> DeepEPResolution:
-    installer = root / "tools" / "ep_kernels" / "install_python_libraries.sh"
-    if not installer.is_file():
-        raise RuntimeError(f"vLLM checkout has no EP installer: {installer}")
-    script = installer.read_text()
-    ref = (
-        _docker_variable(root, "DEEPEP_COMMIT_HASH")
-        or _shell_default(script, "DEEPEP_COMMIT_HASH")
+def resolve(
+    root: Path, venv_hash: str, facts: TreeFacts | None = None
+) -> DeepEPResolution:
+    facts = facts or facts_for(root, "cuda")
+    if not facts.ep_supported:
+        raise RuntimeError(facts.ep_unsupported_reason())
+    installer = facts.ep_installer
+    archs = _cuda_arch_list(facts)
+    ctx = facts.context()
+    fields = {
+        "installer": file_sha256(installer),
+        "ref": facts.deepep_ref,
+        "nccl": facts.nccl_version or "",
+        "venv": venv_hash,
+        "cuda": cuda_version(),
+        "archs": archs,
+    }
+    if parts := rules.key_parts(ctx, "ep"):
+        fields["rules"] = parts
+    key = hashlib.sha256(json.dumps(fields, sort_keys=True).encode()).hexdigest()[:12]
+    return DeepEPResolution(
+        key, facts.deepep_ref, archs, installer,
+        facts.nccl_version or "", facts.pplx_ref or "",
+        overrides=tuple(
+            e.spec for _, e in rules.effects(ctx, rules.OverrideReq, layer="ep")
+        ),
+        patches=tuple(
+            e for _, e in rules.effects(ctx, rules.PatchSource, layer="ep")
+        ),
     )
-    nvshmem = _shell_default(script, "NVSHMEM_VER")
-    nccl = _docker_variable(root, "NCCL_VERSION") or ""
-    archs = _cuda_arch_list(root)
-    payload = json.dumps(
-        {
-            "installer": hashlib.sha256(installer.read_bytes()).hexdigest(),
-            "ref": ref,
-            "nvshmem": nvshmem,
-            "nccl": nccl,
-            "venv": venv_hash,
-            "cuda": cuda_version(),
-            "archs": archs,
-        },
-        sort_keys=True,
-    )
-    key = hashlib.sha256(payload.encode()).hexdigest()[:12]
-    return DeepEPResolution(key, ref, nvshmem, archs, installer, nccl)
 
 
 def _wheels(entry: Path) -> list[Path]:
@@ -104,34 +88,27 @@ def _wheels(entry: Path) -> list[Path]:
 
 
 def _prepare_sources(resolution: DeepEPResolution, workspace: Path) -> None:
-    """Pre-fetch exact refs that historical installer scripts clone loosely."""
-    script = resolution.installer.read_text()
-    try:
-        pplx_ref = _shell_default(script, "PPLX_COMMIT_HASH")
-    except RuntimeError:
-        pplx_ref = ""
-    if pplx_ref:
-        pplx_dir = workspace / "pplx-kernels"
+    """Pre-fetch exact refs that historical installer scripts clone loosely,
+    then apply the rules' source patches to them."""
+    if resolution.pplx_ref:
         fetch_ref(
             "https://github.com/ppl-ai/pplx-kernels",
-            pplx_ref,
-            pplx_dir,
+            resolution.pplx_ref,
+            workspace / "pplx-kernels",
             "pplx-kernels",
         )
-        # Historical pplx-kernels passed this as a malformed CMake warning
-        # option. CMake 4 rejects it; the intended cache variable needs -D.
-        setup = pplx_dir / "setup.py"
-        if setup.is_file():
-            text = setup.read_text()
-            fixed = text.replace('"-WITH_TESTS=OFF"', '"-DWITH_TESTS=OFF"')
-            if fixed != text:
-                setup.write_text(fixed)
     fetch_ref(
         "https://github.com/deepseek-ai/DeepEP",
         resolution.ref,
         workspace / "DeepEP",
         "DeepEP",
     )
+    for patch in resolution.patches:
+        target = workspace / patch.file
+        if target.is_file():
+            text = target.read_text()
+            if (fixed := patch.apply(text)) != text:
+                target.write_text(fixed)
 
 
 def _ensure_wheels(
@@ -171,8 +148,6 @@ def _ensure_wheels(
                 "wheel",
                 "--deepep-ref",
                 resolution.ref,
-                "--nvshmem-ver",
-                resolution.nvshmem_version,
             ],
             env=build_env,
             stream_prefix="[ve]   [DeepEP] ",
@@ -187,7 +162,6 @@ def _ensure_wheels(
                 "kind": "ep-kernels",
                 "hash": resolution.key,
                 "deepep_ref": resolution.ref,
-                "nvshmem_version": resolution.nvshmem_version,
                 "cuda_arch_list": resolution.cuda_arch_list,
                 "wheels": [wheel.name for wheel in wheels],
             },
@@ -216,6 +190,14 @@ def _nccl_lib_dir(venv: Path) -> str:
     return path if path and Path(path).is_dir() else ""
 
 
+def _installed_nccl(venv: Path) -> tuple[str, str] | None:
+    """(CUDA major, version) of the venv's nvidia-nccl-cuNN wheel."""
+    for dist in dist_infos(venv, "nvidia_nccl_cu*"):
+        if m := re.fullmatch(r"nvidia_nccl_cu(\d+)-([^-]+)\.dist-info", dist.name):
+            return m.group(1), m.group(2)
+    return None
+
+
 def _nccl_override(venv: Path, resolution: DeepEPResolution, dest: Path) -> str | None:
     """Write the uv override that keeps NCCL at the version vLLM's image builds
     DeepEP against, and return its path.
@@ -224,54 +206,60 @@ def _nccl_override(venv: Path, resolution: DeepEPResolution, dest: Path) -> str 
     resolves NCCL from the Python environment, but torch requires an exact older
     nvidia-nccl wheel — so any resolve inside the EP installer (it runs
     `uv pip install cmake torch ninja`) drags NCCL back down and the build dies
-    on missing GIN types.  docker/Dockerfile handles this with UV_OVERRIDE for
-    CUDA 13; mirror it, and only when that wheel is in the venv at all (CUDA 12
-    images do not pin NCCL either)."""
-    if not resolution.nccl_version:
+    on missing GIN types.  docker/Dockerfile handles this with UV_OVERRIDE of
+    nvidia-nccl-cu${CUDA_MAJOR} (rule deepep-nccl-override); mirror it for the
+    NCCL wheel the venv's torch actually uses, and only when there is one."""
+    installed = _installed_nccl(venv)
+    if not resolution.overrides or installed is None:
         return None
-    package = "nvidia-nccl-cu13"
-    shown = run(
-        ["uv", "pip", "show", "--python", str(venv / "bin" / "python"), package],
-        check=False,
-    )
-    if shown.returncode != 0:
-        return None
-    installed = re.search(r"^Version:\s*(\S+)", shown.stdout, re.MULTILINE)
-    if not installed or installed.group(1) != resolution.nccl_version:
+    cuda_major, version = installed
+    lines = [
+        spec.format(cuda_major=cuda_major, nccl_version=resolution.nccl_version)
+        for spec in resolution.overrides
+    ]
+    if version != resolution.nccl_version:
         say(
-            f"DeepEP layer: overriding {package}=={resolution.nccl_version} for "
-            f"the NCCL Gin backend (venv has "
-            f"{installed.group(1) if installed else 'none'})"
+            f"DeepEP layer: overriding {', '.join(lines)} for the NCCL Gin "
+            f"backend (venv has {version})"
         )
     dest.parent.mkdir(parents=True, exist_ok=True)
-    dest.write_text(f"{package}=={resolution.nccl_version}\n")
+    dest.write_text("".join(f"{line}\n" for line in lines))
     return str(dest)
 
 
-def _dists_installed(venv: Path, dists: list[str]) -> bool:
-    """Check dist-info presence rather than `import deep_ep`: importing it
-    loads torch, which cost ~3s of wall time on every no-op sync."""
-    sites = list(venv.glob("lib/python*/site-packages"))
-    return all(
-        any(any(site.glob(f"{dist}-*.dist-info")) for site in sites)
-        for dist in dists
-    )
+def _toolkit_cuda_major() -> tuple[Path, str | None]:
+    """The CUDA toolkit the EP installer compiles with (it uses
+    ${CUDA_HOME:-/usr/local/cuda}/bin/nvcc) and its major version."""
+    home = Path(os.environ.get("CUDA_HOME") or "/usr/local/cuda")
+    nvcc = home / "bin" / "nvcc"
+    if not nvcc.is_file():
+        return home, None
+    m = re.search(r"release (\d+)\.", run([str(nvcc), "--version"], check=False).stdout)
+    return home, m.group(1) if m else None
 
 
 def sync_deepep(cfg: Config, root: Path, venv: Path, venv_hash: str) -> None:
     """Install the vLLM-pinned DeepEP wheel into a CUDA environment."""
-    installer = root / "tools" / "ep_kernels" / "install_python_libraries.sh"
-    if not installer.is_file():
-        say("DeepEP layer: unsupported by this vLLM commit — skipping")
+    facts = facts_for(root, "cuda")
+    if not facts.ep_supported:
+        say(f"DeepEP layer: unsupported by this vLLM commit "
+            f"({facts.ep_unsupported_reason()}) — skipping")
         return
-    resolution = resolve(root, venv_hash)
+    cuda_home, toolkit = _toolkit_cuda_major()
+    torch_major = torch_cuda_major(venv)
+    if toolkit and torch_major and toolkit != torch_major:
+        say(f"DeepEP layer: CUDA toolkit {cuda_home} is CUDA {toolkit} but torch "
+            f"is built for CUDA {torch_major} — skipping (set CUDA_HOME to a "
+            f"CUDA {torch_major} toolkit to build DeepEP)")
+        return
+    resolution = resolve(root, venv_hash, facts)
     marker = read_marker(root)
     entry = cfg.store("ep-kernels") / resolution.key
     cached_wheels = _wheels(entry)
     dists = ["deep_ep"]
     if any(w.name.lower().startswith("pplx_kernels-") for w in cached_wheels):
         dists.append("pplx_kernels")
-    installed = _dists_installed(venv, dists)
+    installed = dists_installed(venv, dists)
     if (
         marker.get("deepep_hash") == resolution.key
         and (entry / ".complete").exists()
