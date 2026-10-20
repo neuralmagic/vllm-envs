@@ -42,6 +42,7 @@ class Config:
     cap: str = "minor"  # cap unpinned requirement floors: minor | major | none
     with_test: bool = True  # install & cache requirements/test/<platform>.txt
     with_vllm_extras: bool = True  # install vLLM's optional runtime bundle
+    allow_local_build: bool = True  # build extensions locally when no wheel is available
     raw: dict = field(default_factory=dict)
 
     @property
@@ -75,6 +76,9 @@ def load_config() -> Config:
         cfg.with_vllm_extras = bool(
             venv.get("vllm_extras", venv.get("deepep", cfg.with_vllm_extras))
         )
+        cfg.allow_local_build = bool(
+            venv.get("allow_local_build", cfg.allow_local_build)
+        )
     if v := os.environ.get("VE_MAX_SIZE_GB"):
         cfg.max_size_gb = float(v)
     if v := os.environ.get("VE_ENVS_ROOT"):
@@ -85,6 +89,13 @@ def load_config() -> Config:
         cfg.with_test = v.strip().lower() not in ("0", "false", "no", "off")
     if v := os.environ.get("VE_WITH_VLLM_EXTRAS") or os.environ.get("VE_WITH_DEEPEP"):
         cfg.with_vllm_extras = v.strip().lower() not in (
+            "0",
+            "false",
+            "no",
+            "off",
+        )
+    if v := os.environ.get("VE_ALLOW_LOCAL_BUILD"):
+        cfg.allow_local_build = v.strip().lower() not in (
             "0",
             "false",
             "no",

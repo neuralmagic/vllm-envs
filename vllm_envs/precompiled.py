@@ -137,7 +137,12 @@ def try_fetch_precompiled(cfg: Config, env_root: Path, bhash: str) -> Path | Non
         target.chmod(0o444)
     except Exception as e:
         tmp.unlink(missing_ok=True)
-        say(f"precompiled fetch failed ({e}); will build locally")
+        action = (
+            "will build locally"
+            if cfg.allow_local_build
+            else "local builds are disabled"
+        )
+        say(f"precompiled fetch failed ({e}); {action}")
         return None
     write_meta(
         entry,

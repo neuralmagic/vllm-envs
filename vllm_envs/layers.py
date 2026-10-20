@@ -586,6 +586,8 @@ def resolve_build(cfg: Config, env_root: Path, venv: Path) -> BuildResolution:
                 return BuildResolution(
                     "precompiled-fetch", None, bhash, shared=False
                 )
+            if not cfg.allow_local_build:
+                raise RuntimeError("local builds are disabled")
             build_temp = cfg.store("cmake-build") / bhash
             dist_dir = _scratch(env_root) / "dist"
             try:
@@ -611,6 +613,8 @@ def resolve_build(cfg: Config, env_root: Path, venv: Path) -> BuildResolution:
             return BuildResolution("store-wheel", target, bhash, shared=True)
 
     # dirty or override → private build, never published
+    if not cfg.allow_local_build:
+        raise RuntimeError("local builds are disabled")
     build_temp = _scratch(env_root) / "cmake-build"
     dist_dir = _scratch(env_root) / "dist"
     if dist_dir.exists():
