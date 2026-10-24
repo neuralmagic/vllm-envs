@@ -10,6 +10,28 @@ uv tool install --editable /path/to/vllm-envs   # or: uv pip install -e .
 
 Requires: `uv`, `ccache`, git ≥ 2.15. Reflink-capable filesystem (XFS/btrfs) recommended; falls back to plain copies otherwise.
 
+## Container image
+
+The included CUDA development image contains only the system toolchain and
+`ve`; vLLM's Python dependencies and compiled extensions are assembled at
+runtime from the mounted cache:
+
+```bash
+docker build -t vllm-envs:cuda .
+
+docker run --rm -it --gpus all \
+  -v vllm-envs-cache:/cache \
+  -v "$PWD/vllm:/workspaces/vllm" \
+  -w /workspaces/vllm \
+  vllm-envs:cuda
+```
+
+Inside the container, run `ve init` and activate `.venv` normally. Mount the
+same `/cache` volume into replacement containers to reuse UV downloads,
+dependency layers, ccache objects, FlashInfer kernels, and vLLM build artifacts.
+The default CUDA and UV images support both `linux/amd64` and `linux/arm64` and
+can be replaced with the `CUDA_IMAGE` and `UV_IMAGE` build arguments.
+
 ## Usage
 
 **Manage a clone in place** — build + deps assembled from cache into `./.venv`:
