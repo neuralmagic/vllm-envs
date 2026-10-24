@@ -153,9 +153,10 @@ With `test = true` (the default) the `venvs/` layer also installs vLLM's test
 dependencies (`pytest`, `lm-eval`, ...), cached and reflink-shared like the rest;
 set `test = false` (or `VE_WITH_TEST=0`) to keep envs lean.
 
-When a CUDA vLLM checkout requires `flashinfer-python`, `ve` also installs the
-matching `flashinfer-jit-cache` wheel from FlashInfer's CUDA-specific index.
-This derived dependency is required and has no opt-out.
+When a CUDA vLLM checkout requires `flashinfer-python`, `ve` runs FlashInfer's
+`download-kernels` command. This installs the matching `flashinfer-cubin` and
+`flashinfer-jit-cache` wheels. The cubin wheel is a shared multi-architecture
+package. These derived dependencies are required and have no opt-out.
 
 CUDA environments install the vLLM extras bundle by default using the
 checkout's `tools/ep_kernels/install_python_libraries.sh` and

@@ -159,7 +159,7 @@ def requirement_names(files: list[Path]) -> set[str]:
 
 def _derived_requirement_parts(files: list[Path]) -> list[str]:
     if "flashinfer-python" in requirement_names(files):
-        return ["derived:flashinfer-jit-cache:v1"]
+        return ["derived:flashinfer-kernels:v2"]
     return []
 
 

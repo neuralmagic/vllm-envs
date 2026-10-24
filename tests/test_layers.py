@@ -3,11 +3,11 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import call, patch
+from unittest.mock import patch
 
 from vllm_envs.config import Config
 from vllm_envs.layers import (
-    _install_flashinfer_jit_cache,
+    _install_flashinfer_kernels,
     _install_req_groups,
     _uv_pip,
     ensure_full_template,
@@ -16,55 +16,24 @@ from vllm_envs.layers import (
 from vllm_envs.store import write_meta
 
 
-class FlashInferJitCacheTest(unittest.TestCase):
-    def test_required_flashinfer_installs_matching_cuda_jit_cache(self):
+class FlashInferKernelsTest(unittest.TestCase):
+    def test_required_flashinfer_downloads_kernel_wheels(self):
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         requirements = root / "cuda.txt"
         requirements.write_text("flashinfer-python==0.6.13\n")
         venv = root / ".venv"
+        flashinfer = venv / "bin" / "flashinfer"
+        flashinfer.parent.mkdir(parents=True)
+        flashinfer.touch()
 
         with (
-            patch(
-                "vllm_envs.layers.run",
-                side_effect=[
-                    SimpleNamespace(stdout="Version: 0.6.13\n"),
-                    SimpleNamespace(stdout="13.0\n"),
-                ],
-            ) as run,
-            patch("vllm_envs.layers._uv_pip") as uv_pip,
+            patch("vllm_envs.layers.run") as run,
         ):
-            _install_flashinfer_jit_cache(venv, "cuda", [requirements])
+            _install_flashinfer_kernels(venv, "cuda", [requirements])
 
-        self.assertEqual(
-            run.call_args_list,
-            [
-                call(
-                    [
-                        "uv",
-                        "pip",
-                        "show",
-                        "--python",
-                        str(venv / "bin" / "python"),
-                        "flashinfer-python",
-                    ]
-                ),
-                call(
-                    [
-                        str(venv / "bin" / "python"),
-                        "-c",
-                        "import torch; print(torch.version.cuda or '')",
-                    ]
-                ),
-            ],
-        )
-        uv_pip.assert_called_once_with(
-            venv,
-            [
-                "flashinfer-jit-cache==0.6.13",
-                "--no-deps",
-                "--index-url",
-                "https://flashinfer.ai/whl/cu130",
-            ],
+        run.assert_called_once_with(
+            [str(flashinfer), "download-kernels"],
+            stream_prefix="[ve]   [flashinfer] ",
         )
 
     def test_uv_install_retries_index_rate_limits(self):

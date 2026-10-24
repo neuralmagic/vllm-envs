@@ -105,7 +105,7 @@ def _torch_backend_args(platform: str, requirement_files: list[Path]) -> list[st
     return args
 
 
-def _install_flashinfer_jit_cache(
+def _install_flashinfer_kernels(
     venv: Path, platform: str, requirement_files: list[Path]
 ) -> None:
     if platform != "cuda" or "flashinfer-python" not in requirement_names(
@@ -113,42 +113,15 @@ def _install_flashinfer_jit_cache(
     ):
         return
 
-    package = run(
-        [
-            "uv",
-            "pip",
-            "show",
-            "--python",
-            str(venv / "bin" / "python"),
-            "flashinfer-python",
-        ]
-    ).stdout
-    version_match = re.search(r"^Version:\s*(\S+)", package, re.MULTILINE)
-    if version_match is None:
-        raise RuntimeError("flashinfer-python is required but was not installed")
-    version = version_match.group(1).split("+", 1)[0]
-
-    torch_cuda = run(
-        [
-            str(venv / "bin" / "python"),
-            "-c",
-            "import torch; print(torch.version.cuda or '')",
-        ]
-    ).stdout.strip()
-    cuda_match = re.fullmatch(r"(\d+)\.(\d+)", torch_cuda)
-    if cuda_match is None:
+    flashinfer = venv / "bin" / "flashinfer"
+    if not flashinfer.is_file():
         raise RuntimeError(
-            "cannot select the FlashInfer JIT cache without CUDA version"
+            "flashinfer-python is required but its flashinfer CLI was not installed"
         )
-    cuda_variant = "".join(cuda_match.groups())
-    _uv_pip(
-        venv,
-        [
-            f"flashinfer-jit-cache=={version}",
-            "--no-deps",
-            "--index-url",
-            f"https://flashinfer.ai/whl/cu{cuda_variant}",
-        ],
+
+    run(
+        [str(flashinfer), "download-kernels"],
+        stream_prefix="[ve]   [flashinfer] ",
     )
 
 
@@ -206,7 +179,7 @@ def _install_reqs(
             say(f"venv layer: cap={mode} incompatible → trying cap={nxt}")
             mode = nxt
             continue
-        _install_flashinfer_jit_cache(
+        _install_flashinfer_kernels(
             venv,
             platform,
             requirement_files,
