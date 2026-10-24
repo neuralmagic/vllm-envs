@@ -22,10 +22,9 @@ TREE_PATHS = (
 )
 
 
-def slot(name):
+def files(name):
     def probe(facts: TreeFacts):
-        rule, _ = rules.select(facts.context(), name)
-        return rule.id if rule else None
+        return [p.relative_to(facts.root).as_posix() for p in getattr(facts, name)]
     return probe
 
 
@@ -48,14 +47,14 @@ def fires(rule_id, files="none"):
 
 # (introducing commit, what, probe, value at parent, value at commit)
 BOUNDARIES = (
-    ("206e2577fa9", "requirements/ dir: build layout", slot("layout.build"),
-     "layout-build-root", "layout-build-dir"),
-    ("206e2577fa9", "requirements/test.txt CUDA lock era", slot("layout.test"),
-     "test-lock-root", "test-lock-cuda"),
-    ("fc645f1acc0", "per-platform build requirements", slot("layout.build"),
-     "layout-build-dir", "layout-build-per-platform"),
-    ("fc645f1acc0", "per-platform test locks", slot("layout.test"),
-     "test-lock-cuda", "test-lock-per-platform"),
+    ("206e2577fa9", "requirements/ dir: build layout", files("build_requirements"),
+     ["requirements-build.txt"], ["requirements/build.txt"]),
+    ("206e2577fa9", "requirements/test.txt CUDA lock era", files("test_requirements"),
+     ["requirements-test.txt"], ["requirements/test.txt"]),
+    ("fc645f1acc0", "per-platform build requirements", files("build_requirements"),
+     ["requirements/build.txt"], ["requirements/build/cuda.txt"]),
+    ("fc645f1acc0", "per-platform test locks", files("test_requirements"),
+     ["requirements/test.txt"], ["requirements/test/cuda.txt"]),
     ("d45fe333fb8", "EP installer", fact("ep_installer"), None, EP_INSTALLER),
     ("d45fe333fb8", "installer alone is not enough", fact("ep_supported"),
      False, False),
@@ -72,8 +71,6 @@ BOUNDARIES = (
     ("5d8e90a9661", "NCCL pin", fact("nccl_version"), None, "2.30.7"),
     ("5d8e90a9661", "NCCL override", fires("deepep-nccl-override"), False, True),
     ("f2ace1d57d2", "Rust frontend", fact("rust_frontend"), False, True),
-    ("f2ace1d57d2", "Rust sources hashed", fires("rust-frontend-sources"),
-     False, True),
     ("816cc73a9be", "KV installer", fact("kv_supported"), False, True),
     ("816cc73a9be", "KV --system strip", fires("kv-installer-venv"), False, True),
     ("c9d33c60dcd", "FlashInfer default dependency",

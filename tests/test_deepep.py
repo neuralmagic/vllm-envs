@@ -17,7 +17,7 @@ from vllm_envs.deepep import (
     sync_deepep,
 )
 from vllm_envs.registry import read_marker, write_marker
-from vllm_envs.rules import RULES
+from vllm_envs.workarounds import RULES
 from vllm_envs.store import read_meta
 
 

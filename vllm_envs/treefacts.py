@@ -52,6 +52,8 @@ class ReqLayout:
     test_files: list[Path] = field(default_factory=list)  # optional test deps
 
 
+BUILD_SOURCES = ("csrc", "cmake", "CMakeLists.txt", "setup.py")
+RUST_SOURCES = ("rust", "rust-toolchain.toml", "tools/build_rust.py")
 EP_INSTALLER = "tools/ep_kernels/install_python_libraries.sh"
 KV_INSTALLER = ".buildkite/scripts/install-kv-connectors.sh"
 KV_REQUIREMENTS = "requirements/kv_connectors.txt"
@@ -110,9 +112,7 @@ class TreeFacts:
         self.machine = machine or host_platform.machine()
 
     def context(self, files=()) -> rules.Context:
-        return rules.Context(
-            self.platform, self.machine, self.root, self, tuple(files)
-        )
+        return rules.Context(self.platform, self, tuple(files))
 
     def _file(self, rel: str) -> Path | None:
         p = self.root / rel
@@ -123,27 +123,52 @@ class TreeFacts:
         return p.read_text(errors="replace") if p else ""
 
     # ---- requirements layout -------------------------------------------
+    # 206e2577fa9 (#12547, 2025-03-08) moved root-level requirements-*.txt
+    # into requirements/; fc645f1acc0 (#39024, 2026-04-10) split build deps
+    # and test locks per platform. Each list is newest era first.
 
-    def _slot(self, slot: str) -> list[Path]:
-        return rules.select(self.context(), slot)[1]
+    def _first(self, *candidates: str) -> list[Path]:
+        for rel in candidates:
+            if p := self._file(rel.format(p=self.platform)):
+                return [p]
+        return []
 
-    @fact(detects="layout.build slot rules (file presence)",
-          since="see layout-build-* rules", gates="venv base key + install")
+    @fact(detects="first existing build requirements file",
+          since="206e2577fa9, fc645f1acc0", gates="venv base key + install")
     def build_requirements(self) -> list[Path]:
-        return self._slot("layout.build")
+        return self._first(
+            "requirements/build/{p}.txt", "requirements/{p}-build.txt",
+            "requirements/build.txt", "requirements-{p}-build.txt",
+            "requirements-build.txt",
+        )
 
-    @fact(detects="layout.runtime slot rules (file presence)",
-          since="see layout-runtime-* rules", gates="venv full key + install")
+    @fact(detects="common/<platform>/lint requirements, requirements/ or root",
+          since="206e2577fa9", gates="venv full key + install")
     def runtime_requirements(self) -> list[Path]:
-        return self._slot("layout.runtime")
+        for prefix in ("requirements/", "requirements-"):
+            found = [self._file(f"{prefix}{name}.txt")
+                     for name in ("common", self.platform, "lint")]
+            if found := [p for p in found if p]:
+                return found
+        return []
 
-    @fact(detects="layout.test slot rules (file presence + host arch)",
-          since="see test-* rules", gates="venv full key + install ([venv] test)")
+    @fact(detects="first existing test lock (x86_64 only) or unpinned input",
+          since="206e2577fa9, fc645f1acc0",
+          gates="venv full key + install ([venv] test)")
     def test_requirements(self) -> list[Path]:
-        return self._slot("layout.test")
+        # Locks are compiled for x86_64; other hosts use the unpinned inputs.
+        x86 = self.machine == "x86_64"
+        return self._first(
+            *(["requirements/test/{p}.txt"] if x86 else []),
+            "requirements/test/{p}.in",
+            *(["requirements/test.txt"] if x86 and self.platform == "cuda" else []),
+            *(["requirements/rocm-test.txt"] if x86 and self.platform == "rocm" else []),
+            "requirements/test.in",
+            *(["requirements-test.txt"] if x86 else []),
+        )
 
-    @fact(detects="both build and runtime layout slots matched",
-          since="-", gates="coarse hash-everything fallback (layout-unrecognized)")
+    @fact(detects="build and runtime requirements both found", since="-",
+          gates="coarse hash-every-requirements-file fallback")
     def requirements_recognized(self) -> bool:
         return bool(self.build_requirements and self.runtime_requirements)
 
@@ -172,15 +197,15 @@ class TreeFacts:
 
     @fact(detects="rust-toolchain.toml or rust/Cargo.toml exists",
           since="f2ace1d57d2 (#40848, 2026-05-20)",
-          gates="Rust sources in the build key (rust-frontend-sources)")
+          gates="Rust sources in the build key")
     def rust_frontend(self) -> bool:
         return bool(self._file("rust-toolchain.toml") or self._file("rust/Cargo.toml"))
 
-    @fact(detects="HashPaths effects of fired rules", since="-",
+    @fact(detects="build sources, plus Rust sources with the Rust frontend",
+          since="fdfb2566c03 (#44981) tools/build_rust.py",
           gates="build key, dirty check")
     def build_layer_paths(self) -> tuple[str, ...]:
-        found = rules.effects(self.context(), rules.HashPaths, layer="build")
-        return tuple(dict.fromkeys(p for _, e in found for p in e.paths))
+        return BUILD_SOURCES + (RUST_SOURCES if self.rust_frontend else ())
 
     @cached_property
     def _wheel_paths(self) -> tuple[tuple[str, ...], tuple[str, ...]]:

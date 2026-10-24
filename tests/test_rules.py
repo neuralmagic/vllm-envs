@@ -1,5 +1,4 @@
 import contextlib
-import importlib
 import io
 import json
 import subprocess
@@ -9,14 +8,16 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from vllm_envs import rules, treefacts
+from vllm_envs.hashing import _generated_output
 from vllm_envs.hashing import _derived_requirement_parts, venv_keys
 from vllm_envs.hooks import REQ_WATCH_PATHS
 from vllm_envs.venvlayer import _torch_backend_args
 from vllm_envs.treefacts import FACTS, TreeFacts
+from vllm_envs.workarounds import RULES
 
 
 def rule(rule_id: str) -> rules.Rule:
-    return next(r for r in rules.RULES if r.id == rule_id)
+    return next(r for r in RULES if r.id == rule_id)
 
 
 class TreeCase(unittest.TestCase):
@@ -35,18 +36,18 @@ class TreeCase(unittest.TestCase):
 
 class RuleTableTest(unittest.TestCase):
     def test_ids_are_unique(self):
-        ids = [r.id for r in rules.RULES]
+        ids = [r.id for r in RULES]
         self.assertEqual(len(ids), len(set(ids)))
 
     def test_every_rule_cites_a_reason(self):
-        for r in rules.RULES:
+        for r in RULES:
             with self.subTest(rule=r.id):
                 self.assertTrue(r.reason.strip())
                 self.assertGreaterEqual(r.rev, 1)
                 self.assertTrue(r.then)
 
     def test_fact_predicates_name_registered_facts(self):
-        for r in rules.RULES:
+        for r in RULES:
             for p in r.when:
                 if isinstance(p, rules.Fact):
                     self.assertIn(p.name, FACTS, r.id)
@@ -56,33 +57,10 @@ class RuleTableTest(unittest.TestCase):
             with self.subTest(fact=spec.name):
                 self.assertTrue(spec.detects and spec.since and spec.gates)
 
-    def test_slot_rules_only_select(self):
-        for r in rules.RULES:
-            if r.slot:
-                self.assertTrue(all(isinstance(e, rules.Select) for e in r.then), r.id)
-
-    def test_keyed_effects_name_a_layer(self):
-        for r in rules.RULES:
+    def test_effects_name_a_layer(self):
+        for r in RULES:
             for e in r.then:
-                if e.keyed:
-                    self.assertIn(e.layer, {"venv", "ep", "kv"}, r.id)
-
-    def test_fallback_handlers_exist(self):
-        for r in rules.RULES:
-            for e in r.then:
-                if isinstance(e, rules.Fallback):
-                    parts = e.handler.split(".")
-                    for split in range(len(parts) - 1, 0, -1):
-                        try:
-                            target = importlib.import_module(".".join(parts[:split]))
-                        except ImportError:
-                            continue
-                        for name in parts[split:]:
-                            target = getattr(target, name)
-                        break
-                    else:
-                        self.fail(f"{r.id}: cannot import {e.handler}")
-                    self.assertTrue(callable(target), e.handler)
+                self.assertIn(e.layer, {"venv", "ep", "kv"}, r.id)
 
 
 class LayoutRulesTest(TreeCase):
@@ -138,7 +116,6 @@ class LayoutRulesTest(TreeCase):
         lay = facts.layout(with_test=True)
         self.assertFalse(lay.recognized)
         self.assertEqual(len(lay.build_files), 2)
-        self.assertIn(rule("layout-unrecognized"), rules.fired(facts.context()))
 
     def test_selection_is_not_keyed(self):
         facts = self.facts(self.eras["per-platform"])
@@ -214,10 +191,9 @@ class BuildAndHookRulesTest(TreeCase):
             self.assertIn(path, REQ_WATCH_PATHS)
 
     def test_generated_marlin_sources_are_ignored(self):
-        (ignore,) = rules.untracked_ignores()
-        self.assertTrue(ignore.match("csrc/quantization/marlin/sm80_kernel_fp16.cu"))
-        self.assertTrue(ignore.match("csrc/moe/marlin_moe_wna16/kernel_selector.h"))
-        self.assertFalse(ignore.match("csrc/quantization/marlin/marlin.cu"))
+        self.assertTrue(_generated_output("csrc/quantization/marlin/sm80_kernel_fp16.cu"))
+        self.assertTrue(_generated_output("csrc/moe/marlin_moe_wna16/kernel_selector.h"))
+        self.assertFalse(_generated_output("csrc/quantization/marlin/marlin.cu"))
 
     def test_wheel_paths_from_setup_or_defaults(self):
         self.assertEqual(self.facts(["setup.py"]).wheel_blocking_paths,
@@ -276,25 +252,6 @@ class ExtrasFactsTest(TreeCase):
         self.assertEqual(patch.apply("uv pip install --system -r x"), "uv pip install -r x")
 
 
-class AncestorOfTest(unittest.TestCase):
-    def test_holds_once_head_contains_the_commit(self):
-        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        git = lambda *a: subprocess.run(["git", *a], cwd=root, check=True,
-                                        capture_output=True, text=True).stdout.strip()
-        git("init", "-q")
-        git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q",
-            "--allow-empty", "-m", "a")
-        first = git("rev-parse", "HEAD")
-        git("checkout", "-q", "-b", "side")
-        git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q",
-            "--allow-empty", "-m", "b")
-        second = git("rev-parse", "HEAD")
-        git("checkout", "-q", "-")
-        ctx = rules.Context("cuda", "x86_64", root=root)
-        self.assertTrue(rules.AncestorOf(first).holds(ctx))
-        self.assertFalse(rules.AncestorOf(second).holds(ctx))
-
-
 class ScopeTest(TreeCase):
     def test_facts_are_shared_within_a_sync_only(self):
         root = self.tree([])
@@ -307,8 +264,10 @@ class RulesCommandTest(TreeCase):
     def test_json_explains_facts_and_fired_rules(self):
         from vllm_envs.commands import diagnostics
 
-        root = self.tree(["requirements/build/cuda.txt", "requirements/common.txt",
-                          "requirements/cuda.txt", "rust-toolchain.toml"])
+        root = self.tree({"requirements/build/cuda.txt": "torch==2.9.0\n",
+                          "requirements/common.txt": "x==1\n",
+                          "requirements/cuda.txt": "flashinfer-python==0.6.13\n",
+                          "rust-toolchain.toml": ""})
         subprocess.run(["git", "init", "-q"], cwd=root, check=True)
         cfg = SimpleNamespace(platform="cuda", with_test=True)
         out = io.StringIO()
@@ -319,20 +278,21 @@ class RulesCommandTest(TreeCase):
         self.assertEqual(data["facts"]["build_requirements"]["value"],
                          ["requirements/build/cuda.txt"])
         fired = {r["id"] for r in data["rules"] if r["fired"]}
-        self.assertLessEqual({"layout-build-per-platform", "rust-frontend-sources"}, fired)
+        self.assertIn("flashinfer-jit-cache", fired)
         self.assertNotIn("pplx-with-tests-flag", fired)
 
     def test_text_output(self):
         from vllm_envs.commands import diagnostics
 
-        root = self.tree(["requirements/build/cuda.txt", "requirements/common.txt"])
+        root = self.tree({"requirements/build/cuda.txt": "torch==2.9.0\n",
+                          "requirements/cuda.txt": "flashinfer-python==0.6.13\n"})
         subprocess.run(["git", "init", "-q"], cwd=root, check=True)
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
             diagnostics.cmd_rules(SimpleNamespace(platform="cuda", with_test=True),
                           SimpleNamespace(path=str(root), json=False))
-        self.assertIn("layout-build-per-platform@1", out.getvalue())
-        self.assertIn("reactive fallbacks", out.getvalue())
+        self.assertIn("flashinfer-jit-cache@1  keys: venv-full", out.getvalue())
+        self.assertIn("not firing:", out.getvalue())
 
 
 if __name__ == "__main__":

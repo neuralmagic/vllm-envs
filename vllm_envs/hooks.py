@@ -6,11 +6,11 @@ import sys
 import time
 from pathlib import Path
 
-from . import rules
 from .config import MARKER_NAME, SCRATCH_DIR_NAME, Config
 from .envsync import report_sync_failure, sync
 from .log import error, say, warn
 from .registry import live_envs, register_env, write_marker
+from .treefacts import BUILD_SOURCES, RUST_SOURCES
 from .util import atomic_write_text, git, git_path, git_toplevel, run
 
 HOOK_SENTINEL = "# installed by ve (vllm-envs)"
@@ -58,8 +58,13 @@ SEQUENCER_MARKERS = (
     "REVERT_HEAD",
 )
 
-# Requirements, build inputs and extras inputs, from the rule table.
-REQ_WATCH_PATHS = rules.watch_paths()
+# Inputs of the venv, build (whether or not this commit has the Rust
+# frontend: a checkout can cross it) and extras layers.
+REQ_WATCH_PATHS = (
+    "requirements", *BUILD_SOURCES, *RUST_SOURCES,
+    "docker/versions.json", "docker/Dockerfile", "tools/ep_kernels",
+    ".buildkite/scripts/install-kv-connectors.sh",
+)
 
 
 def _common_dir(path: Path) -> Path:

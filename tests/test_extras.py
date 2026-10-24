@@ -4,7 +4,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from vllm_envs.extras import ExtrasResolution, _sync_kv_connectors, resolve
-from vllm_envs.rules import RULES
+from vllm_envs.workarounds import RULES
 
 KV_PATCHES = next(r for r in RULES if r.id == "kv-installer-venv").then
 

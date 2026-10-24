@@ -81,20 +81,9 @@ def cmd_rules(cfg: Config, args) -> int:
         print(f"  {name:<{width}}  {_fact_value(root, getattr(facts, name))}{since}")
     print("rules fired:")
     for v in verdicts:
-        if not v["fired"] or v["reactive"]:
-            continue
-        if v["slot"]:
-            detail = f"[{v['slot']}] {', '.join(v['selected'])}"
-        elif v["keys"]:
-            detail = f"keys: {', '.join(v['keys'])}"
-        else:
-            detail = "unkeyed: " + "; ".join(v["effects"])
-        print(f"  {v['id']}@{v['rev']}  {detail}")
-        print(f"      {v['reason']}")
+        if v["fired"]:
+            print(f"  {v['id']}@{v['rev']}  keys: {', '.join(v['keys'])}")
+            print(f"      {v['reason']}")
     idle = [v["id"] for v in verdicts if not v["fired"]]
     print(f"not firing: {', '.join(idle) or 'none'}")
-    print("reactive fallbacks (armed, in code):")
-    for v in verdicts:
-        if v["reactive"]:
-            print(f"  {v['id']}@{v['rev']}  {'; '.join(v['effects'])}")
     return 0

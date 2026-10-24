@@ -221,9 +221,9 @@ def cmd_status(cfg: Config, args) -> int:
         print(f"test deps:  included ({rel})")
     else:
         print(f"test deps:  excluded ({'no test reqs found' if cfg.with_test else 'disabled'})")
-    keyed = [f"{v['id']}@{v['rev']}" for v in rules.explain(keys.facts, cfg.with_test)
-             if v["fired"] and v["keys"]]
-    print(f"rules:      {', '.join(keyed) or 'none keyed'}  (`ve rules` explains)")
+    fired = [f"{v['id']}@{v['rev']}" for v in rules.explain(keys.facts, cfg.with_test)
+             if v["fired"]]
+    print(f"rules:      {', '.join(fired) or 'none'}  (`ve rules` explains)")
     build_state = state(m.get("build_hash") or None, bhash)
     if m.get("attach_mode") == "local-build":
         build_state = "private (dirty/override build)"

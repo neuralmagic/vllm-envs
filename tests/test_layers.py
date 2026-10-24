@@ -25,12 +25,12 @@ from vllm_envs.venvlayer import (
 
 
 def compatibility_requirements(files):
-    ctx = rules.Context("cuda", "x86_64", files=tuple(files))
+    ctx = rules.Context("cuda", files=tuple(files))
     return sorted({e.spec for _, e in rules.effects(ctx, rules.AddReq)})
 
 
 def compatibility_overrides(files):
-    ctx = rules.Context("cuda", "x86_64", files=tuple(files))
+    ctx = rules.Context("cuda", files=tuple(files))
     return sorted(
         {e.spec for _, e in rules.effects(ctx, rules.OverrideReq, layer="venv")}
     )
@@ -179,7 +179,7 @@ class CompatibilityRulesTest(unittest.TestCase):
             when=(rules.Req("example-runtime", ">=2.3.0"),),
             then=(rules.AddReq("example-plugin>=5.1"),),
         )
-        ctx = rules.Context("cuda", "x86_64", files=(requirements,))
+        ctx = rules.Context("cuda", files=(requirements,))
 
         self.assertEqual(rules.fired(ctx, (rule,)), [rule])
         self.assertEqual(rules.key_parts(ctx, "venv", (rule,)), ["rule:example@1"])
@@ -203,7 +203,7 @@ class FlashInferJitCacheTest(unittest.TestCase):
             patch("vllm_envs.venvlayer.uv_pip_install") as uv_pip,
         ):
             _derived_installs(
-                venv, rules.Context("cuda", "x86_64", files=(requirements,))
+                venv, rules.Context("cuda", files=(requirements,))
             )
 
         self.assertEqual(

@@ -145,8 +145,16 @@ def venv_keys(
     return VenvKeys(base_hash, _sha(full_parts), layout, facts)
 
 
+# Several vLLM releases generate Marlin instantiations into csrc; they survive
+# checkouts as untracked build outputs, not source edits.
+_GENERATED_OUTPUT = re.compile(
+    r"^csrc/(?:libtorch_stable/)?(?:quantization/marlin|moe/marlin_moe_wna16)/"
+    r"(?:sm\d+_kernel_.*\.cu|kernel_selector\.h)$"
+)
+
+
 def _generated_output(path: str) -> bool:
-    return any(p.match(path) for p in rules.untracked_ignores())
+    return bool(_GENERATED_OUTPUT.match(path))
 
 
 def worktree_content_hash(root: Path, paths: tuple[str, ...]) -> str:
@@ -159,7 +167,6 @@ def worktree_content_hash(root: Path, paths: tuple[str, ...]) -> str:
         ["git", "ls-files", "-o", "--exclude-standard", "-z", "--", *paths],
         cwd=root,
     ).stdout.split("\0")
-    # Untracked build outputs (rules' IgnoreUntracked) are not source edits.
     # Never ignore a tracked path, even if a release starts committing one.
     files = sorted(
         {f for f in tracked if f}

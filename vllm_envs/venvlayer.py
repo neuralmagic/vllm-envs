@@ -47,7 +47,7 @@ def uv_pip_install(venv: Path, args: list[str], env: dict | None = None) -> None
     )
 
 
-_CAP_FALLBACK = {"minor": "major", "major": "none"}  # rule cap-fallback
+_CAP_FALLBACK = {"minor": "major", "major": "none"}
 
 
 def _install_context(
@@ -56,8 +56,7 @@ def _install_context(
     facts = getattr(keys, "facts", None)
     if facts is not None:
         return facts.context(requirement_files)
-    return rules.Context(platform, treefacts.host_platform.machine(),
-                         files=tuple(requirement_files))
+    return rules.Context(platform, files=tuple(requirement_files))
 
 
 def _torch_backend_args(ctx: rules.Context) -> list[str]:
@@ -130,7 +129,7 @@ def _install_reqs(
     """Install requirements with cap constraints, walking down the fallback
     chain (minor → major → none) when caps make resolution unsatisfiable —
     stale floors (e.g. tokenizers>=0.21 vs transformers needing >=0.22) can
-    conflict under tight caps (rule cap-fallback). Returns the cap mode the
+    conflict under tight caps. Returns the cap mode the
     install succeeded with."""
     ctx = _install_context(keys, platform, requirement_files)
     derived_requirements = sorted(
@@ -216,7 +215,7 @@ def _install_req_groups(
     Resolving every file at once is stricter than vLLM itself: upstream installs
     those files in separate passes, so such pairs never have to agree.  Mirror
     that rather than failing the layer; groups are installed in order, so the
-    last group's pins win wherever they overlap (rule split-install-passes).
+    last group's pins win wherever they overlap.
     Returns how the install went, for the template's meta."""
     files = [f for group in groups for f in group]
     if not files:
