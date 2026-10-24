@@ -24,18 +24,11 @@ import zipfile
 from pathlib import Path
 
 from .log import say
-from .util import run
+from .sitepkgs import site_packages
+from .util import atomic_copy, git, run
 
 META_NAME = "editable.json"
 SCHEMA_VERSION = 2
-
-
-def site_packages(venv: Path) -> Path | None:
-    for p in sorted((venv / "lib").glob("python3.*")):
-        sp = p / "site-packages"
-        if sp.is_dir():
-            return sp
-    return None
 
 
 def _artifacts(sp: Path) -> tuple[Path, Path, Path] | None:
@@ -69,15 +62,7 @@ def _console_scripts(dist: Path) -> list[str]:
 
 
 def _head(env_root: Path) -> str:
-    return run(["git", "rev-parse", "HEAD"], cwd=env_root).stdout.strip()
-
-
-def _store_file(src: Path, dst: Path) -> None:
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    tmp = dst.with_name(dst.name + f".tmp{os.getpid()}")
-    shutil.copy2(src, tmp)
-    tmp.chmod(tmp.stat().st_mode & ~0o222)
-    os.replace(tmp, dst)
+    return git(["rev-parse", "HEAD"], cwd=env_root)
 
 
 def capture(env_root: Path, venv: Path, wheel: Path, store_entry: Path) -> None:
@@ -106,7 +91,8 @@ def capture(env_root: Path, venv: Path, wheel: Path, store_entry: Path) -> None:
     mirror = store_entry / "extracted"
     for m in extracted:  # top up the .so mirror with non-.so extracted files
         if not (mirror / m).is_file():
-            _store_file(env_root / m, mirror / m)
+            src = env_root / m
+            atomic_copy(src, mirror / m, src.stat().st_mode & ~0o222)
     site_dir = ed / "site"
     if site_dir.exists():
         shutil.rmtree(site_dir)

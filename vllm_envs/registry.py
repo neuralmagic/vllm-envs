@@ -1,13 +1,12 @@
 """Env registry: envs.json (name -> workspace) + per-env .vllm-env.toml marker."""
 
 import json
-import os
-import tempfile
 import time
 from pathlib import Path
 
 from .config import MARKER_NAME, Config
 from .locks import entry_lock
+from .util import atomic_write_text
 
 
 def _load_registry(cfg: Config) -> dict:
@@ -24,25 +23,7 @@ def load_registry(cfg: Config) -> dict:
 
 def _save_registry(cfg: Config, reg: dict) -> None:
     cfg.registry_path.parent.mkdir(parents=True, exist_ok=True)
-    temp_path = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            dir=cfg.registry_path.parent,
-            prefix=f".{cfg.registry_path.name}.",
-            delete=False,
-        ) as temp_file:
-            temp_path = Path(temp_file.name)
-            temp_file.write(json.dumps(reg, indent=2))
-        os.replace(temp_path, cfg.registry_path)
-    finally:
-        if temp_path is not None:
-            temp_path.unlink(missing_ok=True)
-
-
-def save_registry(cfg: Config, reg: dict) -> None:
-    with entry_lock(cfg.registry_path):
-        _save_registry(cfg, reg)
+    atomic_write_text(cfg.registry_path, json.dumps(reg, indent=2))
 
 
 def register_env(cfg: Config, name: str, path: Path, repo: Path) -> None:
@@ -85,6 +66,10 @@ def live_envs(cfg: Config) -> dict[str, Path]:
 # --- per-env marker (minimal toml writer/reader; stdlib has no toml writer) ---
 
 
+class MarkerError(RuntimeError):
+    pass
+
+
 def write_marker(env_root: Path, data: dict) -> None:
     lines = ["[ve]"]
     for k, v in data.items():
@@ -93,17 +78,26 @@ def write_marker(env_root: Path, data: dict) -> None:
         elif isinstance(v, (int, float)):
             lines.append(f"{k} = {v}")
         else:
-            lines.append(f'{k} = "{v}"')
-    (env_root / MARKER_NAME).write_text("\n".join(lines) + "\n")
+            # JSON string escapes are valid TOML basic-string escapes
+            lines.append(f"{k} = {json.dumps(str(v))}")
+    atomic_write_text(env_root / MARKER_NAME, "\n".join(lines) + "\n")
 
 
 def read_marker(env_root: Path) -> dict:
+    """The env marker ({} when absent). A corrupt marker raises rather than
+    reading as {}: callers treat {} as "unmanaged" and would replace the
+    env's venv."""
     import tomllib
 
+    path = env_root / MARKER_NAME
     try:
-        return tomllib.loads((env_root / MARKER_NAME).read_text()).get("ve", {})
-    except (OSError, tomllib.TOMLDecodeError):
+        text = path.read_text()
+    except FileNotFoundError:
         return {}
+    try:
+        return tomllib.loads(text).get("ve", {})
+    except tomllib.TOMLDecodeError as e:
+        raise MarkerError(f"corrupt env marker {path} ({e}); fix or delete it") from e
 
 
 def update_marker(env_root: Path, **updates) -> None:

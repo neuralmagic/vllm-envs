@@ -1,71 +1,21 @@
-"""Worktree inventory and safe reaping.
+"""Worktree inventory and safe, age-based reaping.
 
-t3code creates a git worktree per session under ~/.t3/worktrees/<repo>/ and
-records each in its state DB (projection_threads: worktree_path, archived_at,
-deleted_at). When a session is archived the worktree is left on disk. This
-module cross-references git, that DB, and the ve registry so `ve reap` can list
-worktrees with enough context to prune them by hand — and refuses to delete
-anything with un-pushed or uncommitted work unless forced.
+Every linked worktree of a repo is a reap candidate once it has been inactive
+for longer than the configured age. `ve reap` refuses to delete anything with
+un-pushed or uncommitted work unless forced.
 """
 
 from __future__ import annotations
 
-import sqlite3
 import time
 from dataclasses import dataclass
-from datetime import datetime
 from pathlib import Path
 
-from .util import run
+from .util import git, git_path, run
 
-T3_DB = Path.home() / ".t3" / "userdata" / "state.sqlite"
-T3_WORKTREES = Path.home() / ".t3" / "worktrees"
-
-
-def _iso_to_epoch(s: str | None) -> float | None:
-    if not s:
-        return None
-    try:
-        return datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()
-    except ValueError:
-        return None
-
-
-def _t3_states(db: Path = T3_DB) -> dict[str, dict]:
-    """Map worktree_path -> {state, activity, branch, title} from t3's DB.
-
-    A path may back several threads; it counts as active if any live thread
-    uses it, else archived if any archived, else deleted.
-    """
-    if not db.exists():
-        return {}
-    try:
-        con = sqlite3.connect(f"file:{db}?mode=ro&immutable=1", uri=True)
-    except sqlite3.Error:
-        return {}
-    try:
-        rows = con.execute(
-            "select worktree_path, branch, title, updated_at, archived_at, "
-            "deleted_at from projection_threads where worktree_path is not null"
-        ).fetchall()
-    except sqlite3.Error:
-        return {}
-    finally:
-        con.close()
-
-    out: dict[str, dict] = {}
-    rank = {"active": 2, "archived": 1, "deleted": 0}
-    for path, branch, title, updated, archived, deleted in rows:
-        state = "deleted" if deleted else ("archived" if archived else "active")
-        activity = _iso_to_epoch(updated) or 0.0
-        cur = out.get(path)
-        if cur is None or activity > cur["activity"]:
-            out[path] = {"state": state, "activity": activity,
-                         "branch": branch or "", "title": title or ""}
-        # a live thread wins the state regardless of which row is newest
-        if rank[state] > rank[out[path]["state"]]:
-            out[path]["state"] = state
-    return out
+# Listing must not write to the worktrees: plain `git status` refreshes the
+# index of every worktree it inspects.
+_NO_LOCKS = {"GIT_OPTIONAL_LOCKS": "0"}
 
 
 @dataclass
@@ -73,19 +23,28 @@ class Worktree:
     path: Path
     branch: str
     head: str
-    state: str  # active | archived | deleted | orphan | external | primary
-    activity: float | None  # epoch of most recent git/t3 touch
-    title: str
+    state: str  # primary | worktree | missing
+    activity: float | None  # epoch of the most recent git activity
     dirty: int  # count of `git status --porcelain` lines
     sync: str  # pushed | merged | ahead:N | local | unknown
+    max_age_s: float = 30 * 86400
+    locked: bool = False  # `git worktree lock`: never reaped, even with --force
 
     @property
     def is_candidate(self) -> bool:
-        """A t3 worktree whose session is gone — eligible for reaping."""
-        return self.state in ("archived", "deleted", "orphan")
+        """Eligible for reaping: a linked worktree inactive past the cutoff."""
+        if self.state == "missing":
+            return True
+        if self.state != "worktree":
+            return False
+        return self.activity is None or time.time() - self.activity > self.max_age_s
 
     def safety(self) -> tuple[bool, str]:
         """Conservative gate: clean tree AND pushed-or-merged."""
+        if self.locked:
+            return False, "locked (git worktree unlock to allow)"
+        if self.state == "missing":
+            return True, "directory gone"
         if self.dirty:
             return False, f"dirty ({self.dirty} uncommitted)"
         if self.sync in ("pushed", "merged"):
@@ -112,6 +71,8 @@ def _porcelain_worktrees(repo: Path) -> list[dict]:
             cur["branch"] = "(detached)"
         elif line == "bare":
             cur["branch"] = "(bare)"
+        elif line == "locked" or line.startswith("locked "):
+            cur["locked"] = True
     if cur:
         entries.append(cur)
     return entries
@@ -139,60 +100,88 @@ def _sync_state(wt: Path, head: str, main_ref: str) -> str:
     return f"ahead:{unpushed}" if unpushed.isdigit() else "local"
 
 
-def _classify(path: Path, primary: Path, t3: dict) -> tuple[str, dict]:
-    if path == primary:
-        return "primary", {}
-    key = str(path)
-    if key in t3:
-        return t3[key]["state"], t3[key]
+def removal_safety(path: Path) -> tuple[bool, str]:
+    """Same gate as `ve reap` for one worktree: clean and pushed-or-merged."""
+    if not path.is_dir():
+        return True, "directory gone"
+    porc = run(["git", "status", "--porcelain"], cwd=path, check=False, env=_NO_LOCKS)
+    dirty = len([ln for ln in porc.stdout.splitlines() if ln.strip()])
+    head = git(["rev-parse", "HEAD"], cwd=path, check=False)
+    wt = Worktree(path=path, branch="", head=head, state="worktree", activity=None,
+                  dirty=dirty, sync=_sync_state(path, head, _main_ref(path)))
+    return wt.safety()
+
+
+def _last_reflog_time(log: Path) -> float | None:
+    """Timestamp of the newest reflog entry. The file's mtime is no good:
+    `git gc` expires reflogs and rewrites every worktree's log at once."""
     try:
-        path.relative_to(T3_WORKTREES)
-        return "orphan", {}
-    except ValueError:
-        return "external", {}
+        with open(log, "rb") as f:
+            f.seek(0, 2)
+            f.seek(max(f.tell() - 4096, 0))
+            lines = f.read().decode(errors="replace").splitlines()
+    except OSError:
+        return None
+    for line in reversed(lines):
+        # "<old> <new> Name <email> <epoch> <tz>\t<message>"
+        fields = line.split("\t", 1)[0].rsplit(" ", 2)
+        if len(fields) == 3 and fields[1].isdigit():
+            return float(fields[1])
+    return None
 
 
-def collect(repo: Path) -> list[Worktree]:
-    """Inventory every worktree of `repo`, enriched with t3 + git state."""
-    t3 = _t3_states()
+def _last_activity(wt: Path) -> float | None:
+    """Latest of the HEAD commit time, the newest HEAD reflog entry, and the
+    worktree's HEAD file mtime, so checking out an old commit still counts
+    as recent use."""
+    times: list[float] = []
+    ct = git(["log", "-1", "--format=%ct"], cwd=wt, check=False)
+    if ct.isdigit():
+        times.append(float(ct))
+    git_dir = git_path(wt, "--absolute-git-dir", check=False)
+    if git_dir is not None:
+        reflog = _last_reflog_time(git_dir / "logs" / "HEAD")
+        if reflog is not None:
+            times.append(reflog)
+        try:
+            times.append((git_dir / "HEAD").stat().st_mtime)
+        except OSError:
+            pass
+    return max(times, default=None)
+
+
+def collect(repo: Path, max_age_days: float = 30.0) -> list[Worktree]:
+    """Inventory every worktree of `repo` with its git state and age."""
     main_ref = _main_ref(repo)
     entries = _porcelain_worktrees(repo)
     primary = Path(entries[0]["path"]) if entries else repo
     out: list[Worktree] = []
     for e in entries:
         path = Path(e["path"])
-        state, meta = _classify(path, primary, t3)
-        exists = path.is_dir()
+        if path == primary:
+            state = "primary"
+        elif not path.is_dir():
+            state = "missing"
+        else:
+            state = "worktree"
         dirty = 0
         sync = "unknown"
-        git_activity = None
-        if exists and state != "primary":
-            porc = run(["git", "status", "--porcelain"], cwd=path, check=False)
+        activity = None
+        if state == "worktree":
+            porc = run(["git", "status", "--porcelain"], cwd=path, check=False,
+                       env=_NO_LOCKS)
             dirty = len([ln for ln in porc.stdout.splitlines() if ln.strip()])
             sync = _sync_state(path, e["head"], main_ref)
-            ct = run(["git", "log", "-1", "--format=%ct"], cwd=path,
-                     check=False).stdout.strip()
-            git_activity = float(ct) if ct.isdigit() else None
-        activity = max(
-            [t for t in (meta.get("activity"), git_activity) if t], default=None
-        )
+            activity = _last_activity(path)
         out.append(Worktree(
             path=path,
-            branch=e["branch"] or meta.get("branch", ""),
+            branch=e["branch"],
             head=e["head"],
             state=state,
             activity=activity,
-            title=meta.get("title", ""),
             dirty=dirty,
             sync=sync,
+            max_age_s=max_age_days * 86400,
+            locked=e.get("locked", False),
         ))
     return out
-
-
-def age_str(epoch: float | None) -> str:
-    if not epoch:
-        return "?"
-    h = (time.time() - epoch) / 3600
-    if h < 48:
-        return f"{h:.0f}h"
-    return f"{h / 24:.0f}d"

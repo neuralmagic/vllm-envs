@@ -9,7 +9,7 @@ from unittest.mock import patch
 
 from vllm_envs.config import Config
 from vllm_envs.hashing import build_key, build_paths_dirty
-from vllm_envs.layers import _build_wheel, local_build_env, resolve_build
+from vllm_envs.buildlayer import _build_wheel, local_build_env, resolve_build
 
 
 class LocalBuildCacheIntegrationTest(unittest.TestCase):
@@ -61,8 +61,8 @@ class LocalBuildCacheIntegrationTest(unittest.TestCase):
             return wheel
 
         with (
-            patch("vllm_envs.layers.try_fetch_precompiled", return_value=None),
-            patch("vllm_envs.layers._build_wheel", side_effect=fake_build),
+            patch("vllm_envs.buildlayer.try_fetch_precompiled", return_value=None),
+            patch("vllm_envs.buildlayer._build_wheel", side_effect=fake_build),
         ):
             first = resolve_build(self.cfg, self.repo, first_venv)
             second = resolve_build(self.cfg, self.other, second_venv)
@@ -91,10 +91,10 @@ class LocalBuildCacheIntegrationTest(unittest.TestCase):
             return real_copy2(source, destination)
 
         with (
-            patch("vllm_envs.layers.build_key", return_value="build-key"),
-            patch("vllm_envs.layers.try_fetch_precompiled", return_value=None),
-            patch("vllm_envs.layers._build_wheel", side_effect=fake_build),
-            patch("vllm_envs.layers.shutil.copy2", side_effect=observe_copy),
+            patch("vllm_envs.buildlayer.build_key", return_value="build-key"),
+            patch("vllm_envs.buildlayer.try_fetch_precompiled", return_value=None),
+            patch("vllm_envs.buildlayer._build_wheel", side_effect=fake_build),
+            patch("vllm_envs.util.shutil.copy2", side_effect=observe_copy),
         ):
             result = resolve_build(self.cfg, self.repo, venv)
 
@@ -182,7 +182,7 @@ class LocalBuildCacheIntegrationTest(unittest.TestCase):
             (dist / "vllm-current.whl").write_bytes(b"current branch")
             return subprocess.CompletedProcess(command, 0, "", "")
 
-        with patch("vllm_envs.layers.run", side_effect=fake_run):
+        with patch("vllm_envs.buildlayer.run", side_effect=fake_run):
             wheel = _build_wheel(
                 self.cfg, self.repo, venv, build_temp, dist,
                 use_pinned_ext=False,

@@ -1,12 +1,23 @@
+import atexit
 import os
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from collections import deque
 from pathlib import Path
 
-from .log import say
+from .log import say, warn
+
+_leftover_spools: list[str] = []
+
+
+@atexit.register
+def _remove_leftover_spools() -> None:
+    for name in _leftover_spools:
+        Path(name).unlink(missing_ok=True)
 
 
 def run(
@@ -36,20 +47,31 @@ def run(
         )
         assert proc.stdout is not None
         recent = deque(maxlen=200)
+        # The decisive error (e.g. ninja's FAILED block) is often thousands of
+        # lines before the end, so keep the full output for the incident log.
+        spool = tempfile.NamedTemporaryFile(
+            "w", prefix="ve-output-", suffix=".log", delete=False
+        )
+        _leftover_spools.append(spool.name)
         try:
-            for line in proc.stdout:
-                recent.append(line)
-                print(
-                    f"{stream_prefix}{line.rstrip()}", file=sys.stderr, flush=True
-                )
+            with spool:
+                for line in proc.stdout:
+                    recent.append(line)
+                    spool.write(line)
+                    print(
+                        f"{stream_prefix}{line.rstrip()}", file=sys.stderr,
+                        flush=True,
+                    )
         finally:
             proc.stdout.close()
-        proc.wait()
+            proc.wait()
+            if not (check and proc.returncode != 0):
+                Path(spool.name).unlink(missing_ok=True)
         output = "".join(recent)
         if check and proc.returncode != 0:
-            raise subprocess.CalledProcessError(
-                proc.returncode, cmd, output=output
-            )
+            err = subprocess.CalledProcessError(proc.returncode, cmd, output=output)
+            err.output_log = spool.name
+            raise err
         return subprocess.CompletedProcess(cmd, proc.returncode, output, "")
     return subprocess.run(
         cmd,
@@ -61,8 +83,75 @@ def run(
     )
 
 
-def git(args: list[str], cwd: Path | str, check: bool = True) -> str:
+# Package-index/network failures that a later attempt can succeed past.
+_TRANSIENT = re.compile(
+    r"429 Too Many Requests|50[234] [A-Z]|Request failed after \d+ retr|"
+    r"error sending request|operation timed out|Connection reset|"
+    r"Temporary failure in name resolution"
+)
+
+
+def is_transient(exc: subprocess.CalledProcessError) -> bool:
+    return bool(_TRANSIENT.search(f"{exc.output or ''}\n{exc.stderr or ''}"))
+
+
+def run_retrying_transient(
+    cmd: list[str], what: str, delays: tuple[int, ...] = (5, 15, 30), **kwargs
+) -> subprocess.CompletedProcess:
+    """`run(..., stream_prefix=...)` that retries network flakes."""
+    for attempt in range(len(delays) + 1):
+        try:
+            return run(cmd, **kwargs)
+        except subprocess.CalledProcessError as exc:
+            if not is_transient(exc) or attempt == len(delays):
+                raise
+            delay = delays[attempt]
+            warn(f"{what} hit a transient network error; retrying in {delay}s "
+                 f"({attempt + 1}/{len(delays)})", log=False)
+            time.sleep(delay)
+    raise AssertionError("unreachable")
+
+
+def atomic_write_text(path: Path, text: str, mode: int | None = None) -> None:
+    """Write via a sibling temp file + rename, so readers never see a
+    truncated file (e.g. after a full disk or a killed process). `mode` is
+    applied before the rename."""
+    tmp = path.with_name(f".{path.name}.tmp{os.getpid()}")
+    try:
+        tmp.write_text(text)
+        if mode is not None:
+            tmp.chmod(mode)
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def atomic_copy(src: Path, dst: Path, mode: int) -> None:
+    """copy2 + chmod to a sibling temp file, then rename: concurrent writers
+    of identical bytes race harmlessly and readers never see a partial file."""
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dst.with_name(dst.name + f".tmp{os.getpid()}")
+    shutil.copy2(src, tmp)
+    tmp.chmod(mode)
+    os.replace(tmp, dst)
+
+
+def git(args: list[str], cwd: Path | str | None = None, check: bool = True) -> str:
     return run(["git", *args], cwd=cwd, check=check).stdout.strip()
+
+
+def git_path(cwd: Path, *args: str, check: bool = True) -> Path | None:
+    """A `git rev-parse` path query (e.g. --git-common-dir, --git-path X),
+    made absolute; None when it fails with check=False."""
+    out = git(["rev-parse", *args], cwd=cwd, check=check)
+    if not out:
+        return None
+    path = Path(out)
+    return path if path.is_absolute() else Path(cwd) / path
+
+
+def git_toplevel(cwd: Path | str) -> Path:
+    return Path(git(["rev-parse", "--show-toplevel"], cwd=cwd))
 
 
 _reflink_support: dict[tuple[int, int], bool] = {}
@@ -147,6 +236,16 @@ def apportioned_size_bytes(path: Path) -> int:
                 continue
             total += st.st_blocks * 512 / max(st.st_nlink, 1)
     return int(total)
+
+
+def age_str(epoch: float | None, digits: int = 0) -> str:
+    """Time since `epoch` in hours, or days from 48h on."""
+    if not epoch:
+        return "?"
+    h = (time.time() - epoch) / 3600
+    if h < 48:
+        return f"{h:.{digits}f}h"
+    return f"{h / 24:.{digits}f}d"
 
 
 def human_size(n: float) -> str:
