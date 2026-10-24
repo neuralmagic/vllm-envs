@@ -106,7 +106,7 @@ An env is just a git worktree plus a private `.venv`, assembled from shared cont
 | `venvs-base/` | torch + build deps | build requirements + torch pins + python/CUDA version |
 | `venvs/` | full deps (derived from `venvs-base`); test deps too when `[venv] test` is on | base key + runtime (+ test) requirements |
 | `ep-kernels/` | cached EP-kernel wheels and their NVSHMEM runtime | vLLM installer + Docker pin + venv/CUDA inputs |
-| `ext-src/` | pinned external sources (cutlass, flash-attn, ...) | project + pin parsed from the worktree's cmake files |
+| `ext-src/` | pinned external sources (cutlass, flash-attn, ...); elfutils headers for DeepGEMM when the host lacks `elfutils-devel` | project + pin parsed from the worktree's cmake files |
 | `builds/` | compiled-extension wheel + extracted-file mirror + editable-install replay | source + Python/Torch ABI + host/compiler/CUDA/GPU target + build flags |
 
 ```mermaid
@@ -145,7 +145,7 @@ Warm-cache timing: fresh `ve new`/`ve init` ~7s, no-op `ve sync` ~1s; a cold bui
 
 ### Precompiled wheels
 
-A wheel from wheels.vllm.ai is reused when its commit has exactly the same *compiled sources* as the worktree HEAD. The path set is vLLM's own `WHEEL_BLOCKING_PATHS` (read from the worktree's `setup.py` without executing it; default `csrc cmake CMakeLists.txt pyproject.toml vllm/_custom_ops.py` for older commits). A commit's identity is the git object id of each of those paths (absent paths count as "missing"), computed for HEAD plus first-parent `origin/main` from the tip to 300 commits before the merge-base in one `git cat-file` call. Matching main commits form a contiguous run that often extends *past* the merge-base, so candidates are HEAD first (release branches publish exact-commit wheels), then matches nearest the merge-base in either direction. Up to 8 are probed in the CUDA variant directory only (`cu129`/`cu130`; like vLLM, the root wheel is never used). vLLM's warning paths (`setup.py`, `rust`) never block a match; a differing one is mentioned in the fetch log. Any uncommitted change under the path set disables the lookup.
+A wheel from wheels.vllm.ai is reused when its commit has exactly the same *compiled sources* as the worktree HEAD. The path set is vLLM's own `WHEEL_BLOCKING_PATHS` (read from the worktree's `setup.py` without executing it; default `csrc cmake CMakeLists.txt pyproject.toml vllm/_custom_ops.py` for older commits). A commit's identity is the git object id of each of those paths (absent paths count as "missing"; `pyproject.toml` counts without its `[tool.*]` lint config), computed for HEAD plus first-parent `origin/main` from the tip to 300 commits before the merge-base in one `git cat-file` call. Matching main commits form a contiguous run that often extends *past* the merge-base, so candidates are HEAD first (release branches publish exact-commit wheels), then matches nearest the merge-base in either direction. Up to 32 are probed, HEAD first and then 8 at a time in parallel (publication has gaps: one outage left 18 consecutive main commits without wheels), in the CUDA variant directory only (`cu129`/`cu130`; like vLLM, the root wheel is never used). vLLM's warning paths (`setup.py`, `rust`) never block a match; a differing one is mentioned in the fetch log. Any uncommitted change under the path set disables the lookup.
 
 Results are remembered in `<cache>/precompiled-index.json`: identity + variant + arch → wheel (permanent), and unpublished commits for 1h (publication lags main by a few commits). The build entry's meta records the source commit, and `ve status` prints a `kernels:` line saying where it sits relative to the worktree's merge-base. `ve precompiled` shows the path set, identity, matching main run, probes and chosen wheel without downloading or writing anything.
 
@@ -169,6 +169,8 @@ cap = "minor"   # cap unpinned requirement floors: minor | major | none (VE_CAP 
 test = true     # install & cache requirements/test/<platform>.txt into the full venv
                 #   (prefers the pinned .txt, falls back to .in); VE_WITH_TEST overrides
 vllm_extras = true  # install the vLLM extras bundle; VE_WITH_VLLM_EXTRAS overrides
+allow_local_build = true  # false: fail instead of compiling when no wheel matches;
+                          #   VE_ALLOW_LOCAL_BUILD overrides
 
 [reap]
 max_age_days = 30   # `ve reap`: worktrees inactive longer are stale;
@@ -206,39 +208,32 @@ Env vars: `VE_CACHE_DIR`, `VE_NO_SYNC=1` (skip hook sync, warn instead),
 Everything `ve` does differently for some vLLM commits lives in two places:
 
 - `vllm_envs/treefacts.py` — **facts**: named, lazily computed probes of the
-  worktree's files (requirements layout, EP installer and its DeepEP/NVSHMEM/
+  worktree's files (which requirements files exist, newest layout era
+  first; EP installer and its DeepEP/NVSHMEM/
   pplx pins, `docker/versions.json` NCCL pin, KV installer, Rust frontend,
   setup.py wheel path sets, ...). Each `@fact` records its detector, the
   upstream commit/PR that introduced what it detects, and what it gates. One
   `TreeFacts` is shared by all consumers during a sync, so e.g. the DeepEP
   layer and the extras bundle key can no longer disagree on "DeepEP supported".
-- `vllm_envs/rules.py` — **rules**: one table, `RULES`, of
-  `Rule(id, rev, reason, when=(...), then=(...), slot=None, priority=0)`.
-  All `when` predicates must hold: `Exists`/`Absent(path)`, `Req(name, spec)`
+- `vllm_envs/workarounds.py` — **rules**: one table, `RULES`, of
+  `Rule(id, rev, reason, when=(...), then=(...))`, evaluated by
+  `vllm_envs/rules.py`. All `when` predicates must hold: `Req(name, spec)`
   (declared in the requirement files being hashed/installed; spec `""`,
-  `">=X"` or `"<X"` on the declared minimum), `Platform`, `Arch`,
-  `Fact(name[, value])`, and `AncestorOf(sha)` as an escape hatch when no
-  content signal exists (none needed so far). Effects: `Select(paths)`
-  (requirements layout slots), `AddReq`, `OverrideReq`, `ExtraIndex`,
-  `DerivedInstall`, `HashPaths` (build key), `WatchPaths` (git hooks),
-  `IgnoreUntracked`, `PatchSource`, and `Fallback(kind, handler)`, which only
-  points at try-and-fallback code (cap fallback, split install passes,
-  short-SHA fetch, ...) so it is discoverable from the table. Within a `slot`
-  the first matching rule wins.
+  `">=X"` or `"<X"` on the declared minimum), `Platform`, and
+  `Fact(name[, value])`. Effects: `AddReq`, `OverrideReq`, `ExtraIndex`,
+  `DerivedInstall` and `PatchSource`.
 
 A rule that fires contributes `rule:<id>@<rev>` to the cache key of each
 layer it changes (`venv-base`/`venv-full`, `ep`, `kv`), so bumping `rev`
 invalidates exactly what the rule affects; rules that do not fire leave keys
-alone. Select/HashPaths/IgnoreUntracked are unkeyed because the files they
-choose are already hashed. Hooks watch every path any rule may hash or
-watch, whether or not it fires at the current commit.
+alone.
 
 To add "commits after X need Y":
 
 1. Find a content signal for X (a file, a pinned version, a setup.py constant)
    — `git -C ~/local/vllm log --diff-filter=A -- <path>` or `-S<text>` finds
    the introducing commit. Add a `@fact` if no predicate expresses it.
-2. Add a `Rule` citing the commit/PR in `reason`, with `rev=1`, and the
+2. Add a `Rule` to `workarounds.py` citing the commit/PR in `reason`, with `rev=1`, and the
    consumer reads it via `rules.effects(ctx, <EffectType>, layer)`.
 3. Add a synthetic test in `tests/test_rules.py` and a row to
    `BOUNDARIES` in `tests/test_boundaries.py` asserting the value at the
@@ -246,8 +241,8 @@ To add "commits after X need Y":
    `VE_VLLM_REPO`, default `~/local/vllm`; skipped without it).
 
 `ve rules [path] [--json]` prints the facts (with their origin), the rules
-that fire with their reasons and affected keys, the rules that do not, and
-the armed reactive fallbacks. `ve status` lists the fired keyed rules.
+that fire with their reasons and affected keys, and the rules that do not.
+`ve status` lists the fired rules.
 
 ## Incident log
 

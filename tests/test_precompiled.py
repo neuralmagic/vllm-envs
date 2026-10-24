@@ -169,6 +169,20 @@ class PrecompiledLookupTest(_Fixture):
         look = self.run_lookup(FakeWheels({self.c2}))
         self.assertEqual(look.chosen.commit, self.c2)
 
+    def test_pyproject_tool_config_is_not_a_compiled_source(self):
+        r = self.repo
+        r.git("switch", "main")
+        base = '[build-system]\nrequires = ["torch==2.11.0"]\n'
+        r.commit("p0", pyproject_DOT_toml=base + '[tool.typos]\nx = ["a"]\n')
+        wheel = r.commit("p1", vllm__x_DOT_py="p1")
+        r.commit("p2", pyproject_DOT_toml=base + '[tool.typos]\nx = ["a", "b"]\n')
+        r.git("switch", "-c", "lint")
+        r.commit("l1", vllm__y_DOT_py="lint")
+        self.assertEqual(self.run_lookup(FakeWheels({wheel})).chosen.commit, wheel)
+
+        r.commit("l2", pyproject_DOT_toml='[build-system]\nrequires = ["torch==2.12.0"]\n')
+        self.assertIsNone(self.run_lookup(FakeWheels({wheel})).url)
+
     def test_missing_path_is_part_of_identity(self):
         oids = object_ids(self.root, [self.c0], ("csrc", "nope.txt"))[self.c0]
         self.assertNotEqual(oids[0], MISSING)

@@ -122,8 +122,10 @@ def _tracking_drift(env_root: Path):
             if (recloned or post != pre
                     or not drift.baseline_path(env_root).exists()
                     or drift.dists_written_since(venv, started)):
-                if pre is not None:
-                    # the baseline is about to move past these; log them first
+                # The baseline is about to move past these; log them first.
+                # A reclone discarded the old venv (logged above), and the
+                # clone's dist-infos keep its template's mtimes.
+                if pre is not None and not recloned:
                     drift.record_if_new(
                         env_root, drift.compute(env_root, pre, before=started),
                         "found by ve sync",

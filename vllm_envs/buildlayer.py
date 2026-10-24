@@ -15,6 +15,7 @@ from .log import say, warn
 from .precompiled import try_fetch_precompiled
 from .registry import read_marker
 from .store import touch_last_used, write_meta
+from .sysdeps import include_env
 from .util import atomic_copy, run
 
 
@@ -88,6 +89,7 @@ def _build_wheel(
     use_pinned_ext: bool,
 ) -> Path:
     env = local_build_env(env_root, venv, cfg)
+    env.update(include_env(cfg))
     if use_pinned_ext:
         env.update(src_dir_env(cfg, env_root))
     build_temp.mkdir(parents=True, exist_ok=True)

@@ -173,6 +173,26 @@ class DriftTest(unittest.TestCase):
         self.assertEqual(d.added, {"ruff": "ruff==0.14.0"})
         self.assertEqual(d.changed, {})
 
+    def test_reclone_with_template_mtimes_is_not_drift(self):
+        self.set_baseline(["mistral-common==1.11.6", "torch==2.9.0"], age_s=1000)
+        self.freeze = ["mistral-common @ git+https://x/mc@abc", "torch==2.9.0"]
+        venv = self.root / ".venv"
+
+        with contextlib.redirect_stderr(io.StringIO()), _tracking_drift(self.root):
+            # a fresh clone of a template built after the old baseline
+            os.rename(venv, self.root / "old-venv")
+            self.sp.mkdir(parents=True)
+            self.install("mistral-common", "1.11.6")
+            self.install("torch", "2.9.0")
+            built = time.time() - 500
+            for d in self.sp.iterdir():
+                os.utime(d, (built, built))
+            self.freeze = ["mistral-common==1.11.6", "torch==2.9.0"]
+
+        (rec,) = errorlog.read(self.cache)
+        self.assertEqual(list(rec["drift"]["changed"]), ["mistral-common"])
+        self.assertTrue(drift.compute(self.root).empty)
+
     def test_first_sync_of_legacy_env_starts_tracking(self):
         with contextlib.redirect_stderr(io.StringIO()), _tracking_drift(self.root):
             pass

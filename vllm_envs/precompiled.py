@@ -15,9 +15,11 @@ import platform as _platform
 import re
 import subprocess
 import time
+import tomllib
 import urllib.error
 import urllib.request
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from urllib.parse import unquote, urljoin
@@ -40,7 +42,10 @@ CUDA_VARIANTS = {"12": "cu129", "13": "cu130"}
 UPSTREAMS = ("origin/main", "upstream/main", "main")
 SEARCH_BEHIND = 300  # main commits older than the merge-base to consider
 SEARCH_AHEAD = 2000  # bounds the scan for long-lived branches
-MAX_PROBES = 8
+# Publication has gaps (one outage left 18 consecutive main commits without
+# wheels); probes are ~100ms and run in parallel, nearest match still wins.
+MAX_PROBES = 32
+PROBE_WORKERS = 8
 PROBE_TIMEOUT_S = 10
 DOWNLOAD_TIMEOUT_S = 30
 NEGATIVE_TTL_S = 3600
@@ -120,8 +125,33 @@ def object_ids(
         cwd=root, input=query, capture_output=True, text=True, check=True,
     ).stdout.splitlines()
     oids = [MISSING if line.endswith(" missing") else line for line in out]
+    oids = _without_tool_config(root, oids, [p for c in commits for p in paths])
     n = len(paths)
     return {c: tuple(oids[i * n:(i + 1) * n]) for i, c in enumerate(commits)}
+
+
+def _without_tool_config(
+    root: Path, oids: list[str], paths: list[str]
+) -> list[str]:
+    """pyproject.toml's [tool.*] tables (ruff, typos, ...) do not reach the
+    compiled extensions; key it on the rest, so a lint-config commit keeps
+    the wheel identity."""
+    digests: dict[str, str] = {}
+    for i, path in enumerate(paths):
+        oid = oids[i]
+        if path != "pyproject.toml" or oid == MISSING:
+            continue
+        if oid not in digests:
+            try:
+                data = tomllib.loads(git(["cat-file", "blob", oid], cwd=root))
+            except (tomllib.TOMLDecodeError, subprocess.CalledProcessError):
+                digests[oid] = oid
+            else:
+                data.pop("tool", None)
+                digests[oid] = "toml:" + hashlib.sha256(
+                    json.dumps(data, sort_keys=True).encode()).hexdigest()
+        oids[i] = digests[oid]
+    return oids
 
 
 def identity_of(paths: tuple[str, ...], oids: tuple[str, ...]) -> str:
@@ -275,21 +305,32 @@ def lookup(cfg: Config, root: Path, *, use_index: bool = True,
         return look
     now = time.time()
     dirty = False
-    for m in look.matches[:MAX_PROBES]:
-        miss_key = f"{m.commit}/{look.variant}/{look.arch}"
-        if use_index and now - index["misses"].get(miss_key, 0) < NEGATIVE_TTL_S:
-            look.probes.append((m.commit, "unpublished (memo)"))
-            continue
-        result, url = _probe(m.commit, look.variant, look.arch)
-        look.probes.append((m.commit, result))
-        if result == "unpublished":
-            index["misses"][miss_key] = now
-            dirty = True
-        if url:
-            look.chosen, look.url, look.source = m, url, "probe"
-            index["hits"][key] = {"commit": m.commit, "url": url, "at": now}
-            dirty = True
-            break
+    miss_key = lambda m: f"{m.commit}/{look.variant}/{look.arch}"
+    candidates = look.matches[:MAX_PROBES]
+    # HEAD alone first: an exact wheel needs one request.
+    waves = [candidates[:1]] + [candidates[i:i + PROBE_WORKERS]
+                                for i in range(1, len(candidates), PROBE_WORKERS)]
+    with ThreadPoolExecutor(PROBE_WORKERS) as pool:
+        for wave in waves:
+            fresh = [m for m in wave if not (use_index and now - index[
+                "misses"].get(miss_key(m), 0) < NEGATIVE_TTL_S)]
+            probed = dict(zip((m.commit for m in fresh), pool.map(
+                lambda m: _probe(m.commit, look.variant, look.arch), fresh)))
+            for m in wave:
+                if m.commit not in probed:
+                    look.probes.append((m.commit, "unpublished (memo)"))
+                    continue
+                result, url = probed[m.commit]
+                look.probes.append((m.commit, result))
+                if result == "unpublished":
+                    index["misses"][miss_key(m)] = now
+                    dirty = True
+                if url and look.url is None:
+                    look.chosen, look.url, look.source = m, url, "probe"
+                    index["hits"][key] = {"commit": m.commit, "url": url, "at": now}
+                    dirty = True
+            if look.url:
+                break
     if record and dirty:
         try:
             _save_index(cfg, index)
