@@ -4,6 +4,8 @@ import re
 import shutil
 import subprocess
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 from . import rules, treefacts
@@ -64,14 +66,18 @@ def _torch_backend_args(ctx: rules.Context) -> list[str]:
         return []
     # uv's --torch-backend selects an index for torch packages only; rules'
     # ExtraIndex effects cover auxiliary wheels (e.g. torchcodec+cu130).
-    args = ["--torch-backend=auto"]
     found = rules.effects(ctx, rules.ExtraIndex)
-    strategies = sorted({e.strategy for _, e in found if e.strategy})
+    variant = rules.effects(ctx, rules.TorchIndex)
+    # A tree that names its variant is installed from that index: the backend
+    # uv derives from the driver would restrict torch to a different one.
+    args = [] if variant else ["--torch-backend=auto"]
+    strategies = sorted({e.strategy for _, e in [*found, *variant] if e.strategy})
     for strategy in strategies:
         args += ["--index-strategy", strategy]
-    for _, effect in found:
-        for url in effect.urls(ctx):
-            args += ["--extra-index-url", url]
+    urls = [url for _, effect in found for url in effect.urls(ctx)]
+    urls += [effect.url_for(ctx) for _, effect in variant]
+    for url in dict.fromkeys(urls):
+        args += ["--extra-index-url", url]
     return args
 
 
@@ -99,21 +105,42 @@ def _torch_cuda_variant(venv: Path) -> str:
     return "".join(match.groups())
 
 
+def _published_variant(index: str, package: str, variant: str) -> str:
+    """The newest variant at or below `variant` (same CUDA major) whose index
+    serves `package`.
+
+    Projects publish per-CUDA wheels for fewer minors than torch does:
+    flashinfer serves cu130 and cu134 but not cu132, and its own installer
+    takes the newest one not above the runtime's. An index that cannot be
+    probed leaves the exact variant, for uv to report."""
+    major, minor = variant[:-1], int(variant[-1])
+    for candidate in (f"{major}{m}" for m in range(minor, -1, -1)):
+        url = f"{index.format(cuda_variant=candidate)}/{package}/"
+        try:
+            with urllib.request.urlopen(url, timeout=10):
+                return candidate
+        except urllib.error.HTTPError as error:
+            if error.code != 404:
+                return variant
+        except OSError:
+            return variant
+    return variant
+
+
 def _derived_installs(venv: Path, ctx: rules.Context) -> None:
     """Install packages rules derive from installed versions (DerivedInstall),
     e.g. flashinfer-jit-cache matching flashinfer-python and torch's CUDA."""
     variant = None
     for _, effect in rules.effects(ctx, rules.DerivedInstall):
         version = _installed_version(venv, effect.version_of)
-        variant = variant or _torch_cuda_variant(venv)
+        index = effect.index
+        if "{cuda_variant}" in index:
+            variant = variant or _torch_cuda_variant(venv)
+            index = index.format(
+                cuda_variant=_published_variant(index, effect.package, variant)
+            )
         uv_pip_install(
-            venv,
-            [
-                f"{effect.package}=={version}",
-                "--no-deps",
-                "--index-url",
-                effect.index.format(cuda_variant=variant),
-            ],
+            venv, [f"{effect.package}=={version}", "--no-deps", "--index-url", index]
         )
 
 

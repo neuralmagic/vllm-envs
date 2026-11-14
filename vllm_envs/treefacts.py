@@ -62,6 +62,10 @@ DEFAULT_BLOCKING_PATHS = (
     "csrc", "cmake", "CMakeLists.txt", "pyproject.toml", "vllm/_custom_ops.py"
 )
 DEFAULT_WARNING_PATHS = ("rust", "setup.py")
+# The variants trees named before #55387. `uv --torch-backend=auto` installs
+# them from the driver alone, and staying on that path keeps those trees'
+# cached venv templates (the torch-variant-index rule would re-key them).
+AUTO_BACKEND_VARIANTS = frozenset({"cu129", "cu130"})
 
 
 def shell_default(script: str, name: str) -> str | None:
@@ -192,6 +196,29 @@ class TreeFacts:
     def flashinfer_python(self) -> bool:
         files = [*self.runtime_requirements, *self.test_requirements]
         return "flashinfer-python" in requirement_names(files)
+
+    # ---- CUDA wheel variant --------------------------------------------
+
+    @fact(detects='setup.py `supported = {12: "cu129", 13: "cu132"}` '
+                  "(host CUDA major -> wheel variant)",
+          since="d0cbac5827 (#32948, 2026-01-23)",
+          gates="torch index, precompiled wheel variant")
+    def cuda_wheel_variants(self) -> dict[str, str]:
+        m = re.search(r"\bsupported\s*=\s*\{([^}]*)\}", self._read("setup.py"))
+        if m is None:
+            return {}
+        return dict(re.findall(r"(\d+)\s*:\s*[\"'](cu\d+)[\"']", m.group(1)))
+
+    @fact(detects="cuda_wheel_variants for this host's CUDA major, unless it "
+                  "is one `uv --torch-backend=auto` already installs",
+          since="3996083d37 (#55387, 2026-11-10)", gates="torch-variant-index")
+    def torch_index_variant(self) -> str | None:
+        if self.platform != "cuda" or not self.cuda_wheel_variants:
+            return None
+        from .hashing import cuda_version  # hashing imports this module
+
+        variant = self.cuda_wheel_variants.get(cuda_version().split(".")[0])
+        return None if variant in AUTO_BACKEND_VARIANTS else variant
 
     # ---- build layer ---------------------------------------------------
 

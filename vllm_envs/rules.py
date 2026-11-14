@@ -160,6 +160,21 @@ class ExtraIndex(Effect):
 
 
 @dataclass(frozen=True)
+class TorchIndex(Effect):
+    """Resolve torch packages from the index of the variant the TreeFacts
+    value `fact` names, instead of the one `uv --torch-backend=auto` derives
+    from the driver."""
+
+    fact: str
+    url: str  # formatted with {variant}
+    strategy: str = ""
+    layer: str = "venv"
+
+    def url_for(self, ctx: Context) -> str:
+        return self.url.format(variant=getattr(ctx.facts, self.fact))
+
+
+@dataclass(frozen=True)
 class PatchSource(Effect):
     file: str  # relative to the patched layer's working directory
     old: str
@@ -263,7 +278,7 @@ def explain(facts: TreeFacts, with_test: bool = True) -> list[dict]:
     out = []
     for rule in _table(None):
         uses_files = any(isinstance(p, Req) for p in rule.when) or any(
-            isinstance(e, ExtraIndex) for e in rule.then)
+            isinstance(e, (ExtraIndex, TorchIndex)) for e in rule.then)
         holds_in = ([name for name, ctx in contexts.items() if rule.holds(ctx)]
                     if uses_files else (["tree"] if rule.holds(facts.context()) else []))
         keys = []
