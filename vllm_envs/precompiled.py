@@ -33,6 +33,7 @@ from .store import touch_last_used, write_meta
 from .treefacts import (  # noqa: F401 (defaults re-exported)
     DEFAULT_BLOCKING_PATHS,
     DEFAULT_WARNING_PATHS,
+    facts_for,
     wheel_paths,
 )
 from .util import atomic_write_text, git, run
@@ -220,11 +221,15 @@ def find_matches(root: Path, paths: tuple[str, ...] | None = None) -> Lookup:
 # --------------------------------------------------------------------------
 
 
-def _variant(platform: str, venv: Path | None = None) -> str | None:
+def _variant(
+    platform: str, venv: Path | None = None, declared: dict[str, str] | None = None
+) -> str | None:
+    """`declared` is the tree's own major -> variant table (setup.py), which
+    names what its commits publish; CUDA_VARIANTS covers trees without one."""
     if platform != "cuda":
         return None
     major = (torch_cuda_major(venv) if venv else None) or cuda_version().split(".")[0]
-    return CUDA_VARIANTS.get(major)
+    return (declared or {}).get(major) or CUDA_VARIANTS.get(major)
 
 
 def _verify_wheel(path: Path) -> None:
@@ -290,7 +295,10 @@ def lookup(cfg: Config, root: Path, *, use_index: bool = True,
     identical sources) and memoizes unpublished commits for NEGATIVE_TTL_S,
     since publication lags main and those commits gain wheels later."""
     look = find_matches(root, paths)
-    look.variant = _variant(cfg.platform or "cuda", root / ".venv")
+    platform = cfg.platform or "cuda"
+    look.variant = _variant(
+        platform, root / ".venv", facts_for(root, platform).cuda_wheel_variants
+    )
     look.arch = _platform.machine()
     if look.variant is None:
         look.reason = "no published wheel variant for this platform/CUDA"

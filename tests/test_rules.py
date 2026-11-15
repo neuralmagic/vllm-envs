@@ -4,8 +4,10 @@ import json
 import subprocess
 import tempfile
 import unittest
+import urllib.error
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from vllm_envs import rules, treefacts
 from vllm_envs.hashing import _generated_output
@@ -139,6 +141,47 @@ class RequirementRulesTest(TreeCase):
         ctx = facts.context([facts.root / "lock.txt"])
         self.assertEqual(_torch_backend_args(ctx), ["--torch-backend=auto"])
         self.assertEqual(rules.key_parts(ctx, "venv"), [])
+
+    SETUP_PY = 'class X:\n    supported = {12: "cu129", 13: "%s"}\n'
+
+    def test_a_tree_naming_a_newer_variant_installs_from_its_index(self):
+        # 3996083d37 (#55387): the lock pins +cu132, which the backend uv
+        # derives from the driver cannot serve.
+        facts = self.facts({"setup.py": self.SETUP_PY % "cu132",
+                            "lock.txt": "torch==2.14.0+cu132\n",
+                            "build.txt": "torch==2.14.0\n"})
+        with patch("vllm_envs.hashing.cuda_version", return_value="13.3"):
+            for name in ("lock.txt", "build.txt"):
+                ctx = facts.context([facts.root / name])
+                self.assertEqual(_torch_backend_args(ctx), [
+                    "--index-strategy", "unsafe-best-match",
+                    "--extra-index-url", "https://download.pytorch.org/whl/cu132",
+                ])
+                self.assertIn("rule:torch-variant-index@1",
+                              rules.key_parts(ctx, "venv"))
+
+    def test_trees_naming_cu130_keep_the_auto_backend_and_their_keys(self):
+        facts = self.facts({"setup.py": self.SETUP_PY % "cu130",
+                            "build.txt": "torch==2.9.0\n"})
+        with patch("vllm_envs.hashing.cuda_version", return_value="13.0"):
+            ctx = facts.context([facts.root / "build.txt"])
+            self.assertEqual(_torch_backend_args(ctx), ["--torch-backend=auto"])
+            self.assertEqual(rules.key_parts(ctx, "venv"), [])
+
+    def test_derived_installs_use_the_newest_published_variant_below_torchs(self):
+        from vllm_envs.venvlayer import _published_variant
+
+        def urlopen(url, timeout):
+            if "/cu130/" not in url:
+                raise urllib.error.HTTPError(url, 404, "Not Found", {}, None)
+            return contextlib.nullcontext()
+
+        index = "https://flashinfer.ai/whl/cu{cuda_variant}"
+        with patch("urllib.request.urlopen", urlopen):
+            self.assertEqual(_published_variant(index, "flashinfer-jit-cache", "132"), "130")
+            self.assertEqual(_published_variant(index, "flashinfer-jit-cache", "130"), "130")
+        with patch("urllib.request.urlopen", side_effect=OSError("offline")):
+            self.assertEqual(_published_variant(index, "flashinfer-jit-cache", "132"), "132")
 
     def test_non_cuda_platforms_get_no_backend_args(self):
         facts = self.facts({"lock.txt": "x==1+cu130\n"}, platform="rocm")

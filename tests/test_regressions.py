@@ -113,6 +113,11 @@ class PrecompiledVariantAndVerifyTest(unittest.TestCase):
         with patch("vllm_envs.precompiled.cuda_version", return_value="13.0"):
             self.assertEqual(precompiled._variant("cuda", self.root / ".venv"), "cu129")
             self.assertEqual(precompiled._variant("cuda", self.root / "none"), "cu130")
+            # A tree's own table (setup.py) names what its commits publish.
+            self.assertEqual(
+                precompiled._variant("cuda", self.root / "none", {"13": "cu132"}), "cu132")
+            self.assertEqual(
+                precompiled._variant("cuda", self.root / ".venv", {"13": "cu132"}), "cu129")
 
     def test_corrupt_download_is_rejected(self):
         import zipfile

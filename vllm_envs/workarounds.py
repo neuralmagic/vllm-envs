@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from .rules import (
     AddReq, DerivedInstall, ExtraIndex, Fact, OverrideReq, PatchSource,
-    Platform, Req, Rule,
+    Platform, Req, Rule, TorchIndex,
 )
 
 RULES: tuple[Rule, ...] = (
@@ -25,6 +25,15 @@ RULES: tuple[Rule, ...] = (
          "torchcodec==0.14.0+cu130) that uv's --torch-backend does not cover",
          when=(Platform("cuda"),),
          then=(ExtraIndex(r"\+cu(\d+)", "https://download.pytorch.org/whl/cu{0}",
+                          strategy="unsafe-best-match"),)),
+    Rule("torch-variant-index", 1,
+         "3996083d37 (#55387) moved the default CUDA build to 13.2 and its "
+         "locks pin torch==X+cu132. `uv --torch-backend=auto` picks the index "
+         "from the driver and uv's own release (0.11.16 has no cu132), so "
+         "those pins cannot resolve; install from the tree's variant instead",
+         when=(Platform("cuda"), Fact("torch_index_variant")),
+         then=(TorchIndex("torch_index_variant",
+                          "https://download.pytorch.org/whl/{variant}",
                           strategy="unsafe-best-match"),)),
     Rule("flashinfer-jit-cache", 1,
          "c9d33c60dcd (#26443) made FlashInfer a default CUDA dependency; "
